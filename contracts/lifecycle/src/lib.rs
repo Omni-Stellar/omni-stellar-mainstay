@@ -1,5 +1,12 @@
 #![no_std]
-use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, Address, Env, String, Symbol, Vec};
+use soroban_sdk::{contract, contractimpl, contracttype, contracterror, panic_with_error, symbol_short, Address, Env, String, Symbol, Vec};
+
+#[contracterror]
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub enum ContractError {
+    NoMaintenanceHistory  = 1,
+    UnauthorizedEngineer  = 2,
+}
 
 #[contracttype]
 #[derive(Clone)]
@@ -11,6 +18,8 @@ pub struct MaintenanceRecord {
     pub timestamp: u64,
 }
 
+const ENG_REGISTRY: Symbol = symbol_short!("ENG_REG");
+
 fn history_key(asset_id: u64) -> (Symbol, u64) {
     (symbol_short!("HIST"), asset_id)
 }
@@ -19,8 +28,13 @@ fn score_key(asset_id: u64) -> (Symbol, u64) {
     (symbol_short!("SCORE"), asset_id)
 }
 
-fn registry_key() -> Symbol {
-    symbol_short!("REGISTRY")
+// Minimal client interface for cross-contract call to EngineerRegistry
+mod engineer_registry {
+    use soroban_sdk::{contractclient, Address, Env};
+    #[contractclient(name = "EngineerRegistryClient")]
+    pub trait EngineerRegistry {
+        fn verify_engineer(env: Env, engineer: Address) -> bool;
+    }
 }
 
 #[contract]
@@ -28,9 +42,9 @@ pub struct Lifecycle;
 
 #[contractimpl]
 impl Lifecycle {
-    /// Must be called once after deployment to set the asset-registry contract address.
-    pub fn initialize(env: Env, asset_registry: Address) {
-        env.storage().instance().set(&registry_key(), &asset_registry);
+    /// Must be called once after deployment to bind the engineer registry.
+    pub fn initialize(env: Env, engineer_registry: Address) {
+        env.storage().instance().set(&ENG_REGISTRY, &engineer_registry);
     }
 
     pub fn submit_maintenance(
@@ -42,14 +56,13 @@ impl Lifecycle {
     ) {
         engineer.require_auth();
 
-        // Validate asset exists in the registry (panics with "asset not found" if not)
-        let registry: Address = env
-            .storage()
-            .instance()
-            .get(&registry_key())
-            .expect("registry not set");
-        let registry_client = asset_registry::AssetRegistryClient::new(&env, &registry);
-        registry_client.get_asset(&asset_id);
+        // Cross-check engineer credential
+        let registry_id: Address = env.storage().instance().get(&ENG_REGISTRY)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::UnauthorizedEngineer));
+        let registry = engineer_registry::EngineerRegistryClient::new(&env, &registry_id);
+        if !registry.verify_engineer(&engineer) {
+            panic_with_error!(&env, ContractError::UnauthorizedEngineer);
+        }
 
         let record = MaintenanceRecord {
             asset_id,
@@ -88,8 +101,8 @@ impl Lifecycle {
             .storage()
             .persistent()
             .get(&history_key(asset_id))
-            .expect("no maintenance history");
-        history.last().expect("no records")
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::NoMaintenanceHistory));
+        history.last().unwrap_or_else(|| panic_with_error!(&env, ContractError::NoMaintenanceHistory))
     }
 
     pub fn get_collateral_score(env: Env, asset_id: u64) -> u32 {
@@ -107,8 +120,23 @@ impl Lifecycle {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use asset_registry::{AssetRegistry, AssetRegistryClient};
-    use soroban_sdk::{symbol_short, testutils::Address as _, Env, String};
+    use soroban_sdk::{symbol_short, testutils::Address as _, BytesN, Env, String};
+    use crate::engineer_registry::EngineerRegistryClient;
+    use engineer_registry_contract::EngineerRegistry;
+
+    mod engineer_registry_contract {
+        soroban_sdk::contractimport!(
+            file = "../../target/wasm32-unknown-unknown/release/engineer_registry.wasm"
+        );
+    }
+
+    fn setup(env: &Env) -> (LifecycleClient, EngineerRegistryClient) {
+        let eng_reg_id = env.register(EngineerRegistry, ());
+        let lifecycle_id = env.register(Lifecycle, ());
+        let lifecycle = LifecycleClient::new(env, &lifecycle_id);
+        lifecycle.initialize(&eng_reg_id);
+        (lifecycle, EngineerRegistryClient::new(env, &eng_reg_id))
+    }
 
     fn setup(env: &Env) -> (LifecycleClient<'_>, AssetRegistryClient<'_>) {
         let registry_id = env.register(AssetRegistry, ());
@@ -125,14 +153,12 @@ mod tests {
     fn test_submit_and_score() {
         let env = Env::default();
         env.mock_all_auths();
-        let (client, registry_client) = setup(&env);
+        let (client, eng_client) = setup(&env);
 
-        let owner = Address::generate(&env);
-        let asset_id = registry_client.register_asset(
-            &symbol_short!("GENSET"),
-            &String::from_str(&env, "Caterpillar 3516"),
-            &owner,
-        );
+        let engineer = Address::generate(&env);
+        let issuer = Address::generate(&env);
+        let hash = BytesN::from_array(&env, &[1u8; 32]);
+        eng_client.register_engineer(&engineer, &hash, &issuer);
 
         let engineer = Address::generate(&env);
         for _ in 0..10 {
@@ -163,6 +189,41 @@ mod tests {
             &symbol_short!("OIL_CHG"),
             &String::from_str(&env, "Should fail"),
             &engineer,
+        );
+    }
+
+    #[test]
+    fn test_unregistered_engineer_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _) = setup(&env);
+
+        let unregistered = Address::generate(&env);
+        let result = client.try_submit_maintenance(
+            &1u64,
+            &symbol_short!("OIL_CHG"),
+            &String::from_str(&env, "Should fail"),
+            &unregistered,
+        );
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::UnauthorizedEngineer as u32
+            )))
+        );
+    }
+
+    #[test]
+    fn test_get_last_service_no_history() {
+        let env = Env::default();
+        let contract_id = env.register(Lifecycle, ());
+        let client = LifecycleClient::new(&env, &contract_id);
+        let result = client.try_get_last_service(&999u64);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::NoMaintenanceHistory as u32
+            )))
         );
     }
 }
