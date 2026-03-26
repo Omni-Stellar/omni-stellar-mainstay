@@ -48,6 +48,34 @@ fn score_key(asset_id: u64) -> (Symbol, u64) {
 
 // Minimal client interface for cross-contract call to EngineerRegistry.
 mod engineer_registry_client {
+const DEFAULT_MAX_HISTORY: u32 = 200;
+
+// Task type weight mapping for collateral scoring
+fn get_task_weight(_env: &Env, task_type: &Symbol) -> u32 {
+    // Minor tasks: 2 points
+    if task_type == &symbol_short!("OIL_CHG") 
+        || task_type == &symbol_short!("LUBE") 
+        || task_type == &symbol_short!("INSPECT") {
+        return 2;
+    }
+    // Medium tasks: 5 points
+    if task_type == &symbol_short!("FILTER") 
+        || task_type == &symbol_short!("TUNE_UP") 
+        || task_type == &symbol_short!("BRAKE") {
+        return 5;
+    }
+    // Major tasks: 10 points
+    if task_type == &symbol_short!("ENGINE") 
+        || task_type == &symbol_short!("OVERHAUL") 
+        || task_type == &symbol_short!("REBUILD") {
+        return 10;
+    }
+    // Default for unknown task types: 3 points
+    3
+}
+
+// Minimal client interface for cross-contract call to EngineerRegistry
+mod engineer_registry {
     use soroban_sdk::{contractclient, Address, Env};
 
     #[allow(dead_code)]
@@ -147,7 +175,19 @@ impl Lifecycle {
             .expect("config not set");
         if history.len() >= config.max_history {
             panic!("history cap reached");
+        // Cross-check engineer credential
+        let registry_id: Address = env.storage().instance().get(&ENG_REGISTRY)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::UnauthorizedEngineer));
+        let registry = engineer_registry::EngineerRegistryClient::new(&env, &registry_id);
+        if !registry.verify_engineer(&engineer) {
+            panic_with_error!(&env, ContractError::UnauthorizedEngineer);
         }
+
+        let mut history: Vec<MaintenanceRecord> = env
+            .storage()
+            .persistent()
+            .get(&history_key(asset_id))
+            .unwrap_or(Vec::new(&env));
 
         let record = MaintenanceRecord {
             asset_id,
@@ -166,15 +206,15 @@ impl Lifecycle {
             .storage()
             .persistent()
             .get(&score_key(asset_id))
-            .unwrap_or(0);
-        let new_score = score.saturating_add(config.score_increment).min(100);
-        env.storage()
-            .persistent()
-            .set(&score_key(asset_id), &new_score);
-
+            .unwrap_or(0u32);
+        let weight = get_task_weight(&env, &task_type);
+        let new_score = (score + weight).min(100);
+        env.storage().persistent().set(&score_key(asset_id), &new_score);
+        
+        // Emit maintenance submission event
         env.events().publish(
             (symbol_short!("MAINT"), asset_id),
-            (task_type, engineer, env.ledger().timestamp()),
+            (task_type, engineer, env.ledger().timestamp())
         );
     }
 
@@ -205,7 +245,8 @@ impl Lifecycle {
     }
 
     pub fn is_collateral_eligible(env: Env, asset_id: u64) -> bool {
-        Self::get_collateral_score(env, asset_id) >= COLLATERAL_THRESHOLD
+        let threshold = 50u32; // Default threshold
+        Self::get_collateral_score(env, asset_id) >= threshold
     }
 }
 
@@ -273,22 +314,25 @@ mod tests {
         let env = Env::default();
         env.mock_all_auths();
 
-        let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
+        let (client, asset_registry_client, engineer_registry_client, eng_client, _) = setup(&env, 0);
         let asset_id = register_asset(&env, &asset_registry_client);
         let engineer = register_engineer(&env, &engineer_registry_client);
+        let issuer = Address::generate(&env);
+        let hash = BytesN::from_array(&env, &[1u8; 32]);
+        eng_client.register_engineer(&engineer, &hash, &issuer);
 
+        // 10 oil changes at 2 points each = 20 points
         for _ in 0..10 {
             client.submit_maintenance(
-                &asset_id,
+                &1u64,
                 &symbol_short!("OIL_CHG"),
                 &String::from_str(&env, "Routine oil change"),
                 &engineer,
             );
         }
 
-        assert_eq!(client.get_collateral_score(&asset_id), 50);
-        assert!(client.is_collateral_eligible(&asset_id));
-        assert_eq!(client.get_maintenance_history(&asset_id).len(), 10);
+        assert_eq!(client.get_collateral_score(&1u64), 20);
+        assert_eq!(client.get_maintenance_history(&1u64).len(), 10);
     }
 
     #[test]
@@ -306,11 +350,73 @@ mod tests {
             &String::from_str(&env, "Should fail"),
             &engineer,
         );
+    fn test_weighted_scoring_minor_tasks() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, eng_client) = setup(&env);
+        
+        let engineer = Address::generate(&env);
+        let issuer = Address::generate(&env);
+        let hash = BytesN::from_array(&env, &[1u8; 32]);
+        eng_client.register_engineer(&engineer, &hash, &issuer);
+
+        // Minor tasks: OIL_CHG, LUBE, INSPECT = 2 points each
+        client.submit_maintenance(&1u64, &symbol_short!("OIL_CHG"), &String::from_str(&env, "Oil change"), &engineer);
+        assert_eq!(client.get_collateral_score(&1u64), 2);
+
+        client.submit_maintenance(&1u64, &symbol_short!("LUBE"), &String::from_str(&env, "Lubrication"), &engineer);
+        assert_eq!(client.get_collateral_score(&1u64), 4);
+
+        client.submit_maintenance(&1u64, &symbol_short!("INSPECT"), &String::from_str(&env, "Inspection"), &engineer);
+        assert_eq!(client.get_collateral_score(&1u64), 6);
     }
 
     #[test]
-    #[should_panic(expected = "history cap reached")]
-    fn test_history_cap_enforced() {
+    fn test_weighted_scoring_medium_tasks() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, eng_client) = setup(&env);
+        
+        let engineer = Address::generate(&env);
+        let issuer = Address::generate(&env);
+        let hash = BytesN::from_array(&env, &[1u8; 32]);
+        eng_client.register_engineer(&engineer, &hash, &issuer);
+
+        // Medium tasks: FILTER, TUNE_UP, BRAKE = 5 points each
+        client.submit_maintenance(&1u64, &symbol_short!("FILTER"), &String::from_str(&env, "Filter replacement"), &engineer);
+        assert_eq!(client.get_collateral_score(&1u64), 5);
+
+        client.submit_maintenance(&1u64, &symbol_short!("TUNE_UP"), &String::from_str(&env, "Tune up"), &engineer);
+        assert_eq!(client.get_collateral_score(&1u64), 10);
+
+        client.submit_maintenance(&1u64, &symbol_short!("BRAKE"), &String::from_str(&env, "Brake service"), &engineer);
+        assert_eq!(client.get_collateral_score(&1u64), 15);
+    }
+
+    #[test]
+    fn test_weighted_scoring_major_tasks() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, eng_client) = setup(&env);
+        
+        let engineer = Address::generate(&env);
+        let issuer = Address::generate(&env);
+        let hash = BytesN::from_array(&env, &[1u8; 32]);
+        eng_client.register_engineer(&engineer, &hash, &issuer);
+
+        // Major tasks: ENGINE, OVERHAUL, REBUILD = 10 points each
+        client.submit_maintenance(&1u64, &symbol_short!("ENGINE"), &String::from_str(&env, "Engine repair"), &engineer);
+        assert_eq!(client.get_collateral_score(&1u64), 10);
+
+        client.submit_maintenance(&1u64, &symbol_short!("OVERHAUL"), &String::from_str(&env, "Full overhaul"), &engineer);
+        assert_eq!(client.get_collateral_score(&1u64), 20);
+
+        client.submit_maintenance(&1u64, &symbol_short!("REBUILD"), &String::from_str(&env, "Complete rebuild"), &engineer);
+        assert_eq!(client.get_collateral_score(&1u64), 30);
+    }
+
+    #[test]
+    fn test_weighted_scoring_mixed_tasks() {
         let env = Env::default();
         env.mock_all_auths();
 

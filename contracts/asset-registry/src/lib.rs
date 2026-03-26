@@ -52,7 +52,7 @@ impl AssetRegistry {
         owner.require_auth();
 
         // Deduplication: reject if this owner already registered identical metadata.
-        let meta_bytes = metadata.clone().to_xdr(&env);
+        let meta_bytes = Bytes::from(metadata.clone().to_xdr(&env));
         let meta_hash: BytesN<32> = env.crypto().sha256(&meta_bytes).into();
         let dk = dedup_key(&owner, &meta_hash);
         if env.storage().persistent().has(&dk) {
