@@ -138,6 +138,17 @@ mod tests {
         (lifecycle, EngineerRegistryClient::new(env, &eng_reg_id))
     }
 
+    fn setup(env: &Env) -> (LifecycleClient<'_>, AssetRegistryClient<'_>) {
+        let registry_id = env.register(AssetRegistry, ());
+        let registry_client = AssetRegistryClient::new(env, &registry_id);
+
+        let lifecycle_id = env.register(Lifecycle, ());
+        let client = LifecycleClient::new(env, &lifecycle_id);
+        client.initialize(&registry_id);
+
+        (client, registry_client)
+    }
+
     #[test]
     fn test_submit_and_score() {
         let env = Env::default();
@@ -149,18 +160,36 @@ mod tests {
         let hash = BytesN::from_array(&env, &[1u8; 32]);
         eng_client.register_engineer(&engineer, &hash, &issuer);
 
+        let engineer = Address::generate(&env);
         for _ in 0..10 {
             client.submit_maintenance(
-                &1u64,
+                &asset_id,
                 &symbol_short!("OIL_CHG"),
                 &String::from_str(&env, "Routine oil change"),
                 &engineer,
             );
         }
 
-        assert_eq!(client.get_collateral_score(&1u64), 50);
-        assert!(client.is_collateral_eligible(&1u64));
-        assert_eq!(client.get_maintenance_history(&1u64).len(), 10);
+        assert_eq!(client.get_collateral_score(&asset_id), 50);
+        assert!(client.is_collateral_eligible(&asset_id));
+        assert_eq!(client.get_maintenance_history(&asset_id).len(), 10);
+    }
+
+    #[test]
+    #[should_panic(expected = "asset not found")]
+    fn test_submit_maintenance_nonexistent_asset() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _) = setup(&env);
+
+        let engineer = Address::generate(&env);
+        // asset_id 999 was never registered — must panic
+        client.submit_maintenance(
+            &999u64,
+            &symbol_short!("OIL_CHG"),
+            &String::from_str(&env, "Should fail"),
+            &engineer,
+        );
     }
 
     #[test]
