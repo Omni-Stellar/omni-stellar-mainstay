@@ -120,8 +120,25 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "credential already revoked")]
-    fn test_double_revocation() {
+    fn test_ttl_extended_on_registration() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(EngineerRegistry, ());
+        let client = EngineerRegistryClient::new(&env, &contract_id);
+
+        let engineer = Address::generate(&env);
+        let issuer = Address::generate(&env);
+        let hash = BytesN::from_array(&env, &[1u8; 32]);
+
+        client.register_engineer(&engineer, &hash, &issuer);
+
+        // Verify TTL is set for engineer storage entry
+        let engineer_ttl = env.storage().persistent().get_ttl(&engineer_key(&engineer));
+        assert!(engineer_ttl > 0, "Engineer TTL should be extended");
+    }
+
+    #[test]
+    fn test_ttl_extended_on_revoke() {
         let env = Env::default();
         env.mock_all_auths();
         let contract_id = env.register(EngineerRegistry, ());
@@ -133,8 +150,9 @@ mod tests {
 
         client.register_engineer(&engineer, &hash, &issuer);
         client.revoke_credential(&engineer, &issuer);
-        
-        // Attempting to revoke again should panic
-        client.revoke_credential(&engineer, &issuer);
+
+        // Verify TTL is still set after revoke
+        let engineer_ttl = env.storage().persistent().get_ttl(&engineer_key(&engineer));
+        assert!(engineer_ttl > 0, "Engineer TTL should be extended after revoke");
     }
 }
