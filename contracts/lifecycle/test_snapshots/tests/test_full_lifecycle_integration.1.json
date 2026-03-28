@@ -74,9 +74,6 @@
                 },
                 {
                   "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAOLZM"
-                },
-                {
-                  "u64": 31536000
                 }
               ]
             }
@@ -620,14 +617,6 @@
                     },
                     {
                       "key": {
-                        "symbol": "expires_at"
-                      },
-                      "val": {
-                        "u64": 31536000
-                      }
-                    },
-                    {
-                      "key": {
                         "symbol": "issued_at"
                       },
                       "val": {
@@ -697,7 +686,7 @@
             },
             "ext": "v0"
           },
-          4095
+          518400
         ]
       ],
       [

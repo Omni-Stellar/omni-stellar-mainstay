@@ -67,9 +67,6 @@
                 },
                 {
                   "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
-                },
-                {
-                  "u64": 31536000
                 }
               ]
             }
@@ -95,9 +92,6 @@
                 },
                 {
                   "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4"
-                },
-                {
-                  "u64": 31536000
                 }
               ]
             }
@@ -180,14 +174,6 @@
                       },
                       "val": {
                         "bytes": "0101010101010101010101010101010101010101010101010101010101010101"
-                      }
-                    },
-                    {
-                      "key": {
-                        "symbol": "expires_at"
-                      },
-                      "val": {
-                        "u64": 31536000
                       }
                     },
                     {
@@ -278,14 +264,6 @@
                     },
                     {
                       "key": {
-                        "symbol": "expires_at"
-                      },
-                      "val": {
-                        "u64": 31536000
-                      }
-                    },
-                    {
-                      "key": {
                         "symbol": "issued_at"
                       },
                       "val": {
@@ -355,7 +333,7 @@
             },
             "ext": "v0"
           },
-          4095
+          518400
         ]
       ],
       [
@@ -404,7 +382,7 @@
             },
             "ext": "v0"
           },
-          4095
+          518400
         ]
       ],
       [
