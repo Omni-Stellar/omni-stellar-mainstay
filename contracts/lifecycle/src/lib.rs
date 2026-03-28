@@ -430,6 +430,28 @@ impl Lifecycle {
             env.deployer().update_current_contract_wasm(_new_wasm_hash);
         }
     }
+
+    /// Admin-only: reset an asset's collateral score to zero.
+    /// Use in cases of fraud or after an asset transfer.
+    pub fn reset_score(env: Env, admin: Address, asset_id: u64) {
+        admin.require_auth();
+
+        let config: Config = env
+            .storage()
+            .instance()
+            .get(&CONFIG)
+            .expect("config not set");
+        if config.admin != admin {
+            panic_with_error!(&env, ContractError::UnauthorizedAdmin);
+        }
+
+        env.storage().persistent().set(&score_key(asset_id), &0u32);
+
+        env.events().publish(
+            (symbol_short!("RST_SCR"), asset_id),
+            (admin, env.ledger().timestamp()),
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1030,5 +1052,54 @@ mod tests {
         assert_eq!(last.asset_id, asset_id);
         assert_eq!(last.engineer, engineer);
         assert_eq!(last.task_type, symbol_short!("ENGINE"));
+    }
+
+    #[test]
+    fn test_admin_can_reset_score() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, engineer_registry_client, admin) = setup(&env, 0);
+        let asset_id = register_asset(&env, &asset_registry_client);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+
+        // Build up a non-zero score
+        client.submit_maintenance(
+            &asset_id,
+            &symbol_short!("ENGINE"),
+            &String::from_str(&env, "Major overhaul"),
+            &engineer,
+        );
+        assert!(client.get_collateral_score(&asset_id) > 0);
+
+        // Admin resets the score
+        client.reset_score(&admin, &asset_id);
+        assert_eq!(client.get_collateral_score(&asset_id), 0);
+    }
+
+    #[test]
+    fn test_non_admin_cannot_reset_score() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
+        let asset_id = register_asset(&env, &asset_registry_client);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+
+        client.submit_maintenance(
+            &asset_id,
+            &symbol_short!("ENGINE"),
+            &String::from_str(&env, "Major overhaul"),
+            &engineer,
+        );
+
+        let outsider = Address::generate(&env);
+        let result = client.try_reset_score(&outsider, &asset_id);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::UnauthorizedAdmin as u32,
+            ))),
+        );
     }
 }
