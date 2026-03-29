@@ -1331,4 +1331,39 @@ mod tests {
             ))),
         );
     }
+
+    #[test]
+    fn test_non_owner_cannot_deregister_asset() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize_admin(&admin);
+
+        let owner = Address::generate(&env);
+        let id = client.register_asset(
+            &symbol_short!("GENSET"),
+            &String::from_str(&env, "CAT-3516"),
+            &owner,
+        );
+
+        // Only authorize the owner, not the admin — deregister_asset requires admin auth
+        use soroban_sdk::IntoVal;
+        env.mock_auths(&[soroban_sdk::testutils::MockAuth {
+            address: &owner,
+            invoke: &soroban_sdk::testutils::MockAuthInvoke {
+                contract: &contract_id,
+                fn_name: "deregister_asset",
+                args: (id,).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+
+        // Auth framework rejects the call because admin.require_auth() is not satisfied
+        assert!(client.try_deregister_asset(&id).is_err());
+        // Asset must still exist
+        assert!(client.asset_exists(&id));
+    }
 }

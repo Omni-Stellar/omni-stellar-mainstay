@@ -13,6 +13,7 @@ pub enum ContractError {
     UntrustedIssuer = 6,
     InvalidCredentialHash = 7,
     Paused = 8,
+    CredentialRevoked = 9,
 }
 
 #[contracttype]
@@ -174,6 +175,37 @@ impl EngineerRegistry {
         env.events().publish(
             (symbol_short!("REV_CRED"), engineer.clone()),
             (record.issuer.clone(), env.ledger().timestamp()),
+        );
+    }
+
+    /// Renew an engineer's credential by extending the expiry.
+    /// Only the original issuer can renew credentials.
+    ///
+    /// # Arguments
+    /// * `engineer` - The address of the engineer whose credential should be renewed
+    /// * `new_validity_period` - Duration in seconds from now for the renewed credential
+    ///
+    /// # Panics
+    /// - [`ContractError::EngineerNotFound`] if no engineer exists with the given address
+    /// - [`ContractError::CredentialRevoked`] if the credential has been revoked
+    pub fn renew_credential(env: Env, engineer: Address, new_validity_period: u64) {
+        ensure_not_paused(&env);
+        let mut record: Engineer = env
+            .storage()
+            .persistent()
+            .get(&engineer_key(&engineer))
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::EngineerNotFound));
+        record.issuer.require_auth();
+        if !record.active {
+            panic_with_error!(&env, ContractError::CredentialRevoked);
+        }
+        record.expires_at = env.ledger().timestamp() + new_validity_period;
+        env.storage().persistent().extend_ttl(&engineer_key(&engineer), 518400, 518400);
+        env.storage().persistent().set(&engineer_key(&engineer), &record);
+
+        env.events().publish(
+            (symbol_short!("RNW_CRED"), engineer.clone()),
+            (record.issuer.clone(), record.expires_at),
         );
     }
 
@@ -905,5 +937,119 @@ mod tests {
             client.try_upgrade(&admin, &BytesN::from_array(&env, &[0u8; 32])),
             Err(Ok(soroban_sdk::Error::from_contract_error(ContractError::Paused as u32)))
         );
+
+        // renew_credential
+        assert_eq!(
+            client.try_renew_credential(&engineer, &31_536_000),
+            Err(Ok(soroban_sdk::Error::from_contract_error(ContractError::Paused as u32)))
+        );
+    }
+
+    // --- renew_credential tests ---
+
+    #[test]
+    fn test_renew_credential_extends_expiry() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin) = setup(&env);
+
+        let engineer = Address::generate(&env);
+        let issuer = Address::generate(&env);
+        let hash = BytesN::from_array(&env, &[1u8; 32]);
+
+        client.add_trusted_issuer(&admin, &issuer);
+        client.register_engineer(&engineer, &hash, &issuer, &1000);
+
+        // Advance past original expiry
+        env.ledger().with_mut(|li| li.timestamp = li.timestamp + 1001);
+        assert!(!client.verify_engineer(&engineer));
+
+        // Renew for another 1000 seconds from now
+        client.renew_credential(&engineer, &1000);
+        assert!(client.verify_engineer(&engineer));
+
+        let record = client.get_engineer(&engineer);
+        assert_eq!(record.expires_at, env.ledger().timestamp() + 1000);
+    }
+
+    #[test]
+    fn test_renew_credential_revoked_engineer_fails() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin) = setup(&env);
+
+        let engineer = Address::generate(&env);
+        let issuer = Address::generate(&env);
+        let hash = BytesN::from_array(&env, &[1u8; 32]);
+
+        client.add_trusted_issuer(&admin, &issuer);
+        client.register_engineer(&engineer, &hash, &issuer, &31_536_000);
+        client.revoke_credential(&engineer);
+
+        let result = client.try_renew_credential(&engineer, &31_536_000);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::CredentialRevoked as u32,
+            ))),
+        );
+    }
+
+    #[test]
+    fn test_renew_credential_unknown_engineer_fails() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _) = setup(&env);
+
+        let unknown = Address::generate(&env);
+        let result = client.try_renew_credential(&unknown, &31_536_000);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::EngineerNotFound as u32,
+            ))),
+        );
+    }
+
+    #[test]
+    fn test_renew_credential_emits_event() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin) = setup(&env);
+
+        let engineer = Address::generate(&env);
+        let issuer = Address::generate(&env);
+        let hash = BytesN::from_array(&env, &[1u8; 32]);
+
+        client.add_trusted_issuer(&admin, &issuer);
+        client.register_engineer(&engineer, &hash, &issuer, &1000);
+        client.renew_credential(&engineer, &2000);
+
+        let events = env.events().all();
+        let (_, topics, _) = events.last().unwrap();
+        use soroban_sdk::TryIntoVal;
+        let t0: Symbol = topics.get(0).unwrap().try_into_val(&env).unwrap();
+        assert_eq!(t0, symbol_short!("RNW_CRED"));
+    }
+
+    #[test]
+    fn test_renew_credential_extends_ttl() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin) = setup(&env);
+
+        let engineer = Address::generate(&env);
+        let issuer = Address::generate(&env);
+        let hash = BytesN::from_array(&env, &[1u8; 32]);
+
+        client.add_trusted_issuer(&admin, &issuer);
+        client.register_engineer(&engineer, &hash, &issuer, &1000);
+        client.renew_credential(&engineer, &31_536_000);
+
+        let contract_id = client.address.clone();
+        let ttl = env.as_contract(&contract_id, || {
+            env.storage().persistent().get_ttl(&engineer_key(&engineer))
+        });
+        assert!(ttl > 0, "TTL should be extended after renewal");
     }
 }
