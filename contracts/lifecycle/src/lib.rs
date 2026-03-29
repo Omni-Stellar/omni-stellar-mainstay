@@ -928,6 +928,13 @@ impl Lifecycle {
         apply_decay(&env, asset_id, false, false) >= config.eligibility_threshold
     }
 
+    /// Returns the timestamp of the most recent maintenance event, or None if no maintenance has been submitted.
+    pub fn get_last_service_timestamp(env: Env, asset_id: u64) -> Option<u64> {
+        env.storage()
+            .persistent()
+            .get(&last_update_key(asset_id))
+    }
+
     /// Get the address of the asset registry contract.
     ///
     /// # Returns
@@ -3055,6 +3062,48 @@ mod tests {
                 ContractError::UnauthorizedAdmin as u32,
             ))),
         );
+    }
+
+    // --- get_last_service_timestamp tests ---
+
+    #[test]
+    fn test_get_last_service_timestamp_none_before_maintenance() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, _, _) = setup(&env, 0);
+        let asset_id = register_asset(&env, &asset_registry_client);
+
+        assert_eq!(client.get_last_service_timestamp(&asset_id), None);
+    }
+
+    #[test]
+    fn test_get_last_service_timestamp_returns_ledger_time() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
+        let asset_id = register_asset(&env, &asset_registry_client);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+
+        let t0 = env.ledger().timestamp();
+        client.submit_maintenance(
+            &asset_id,
+            &symbol_short!("OIL_CHG"),
+            &String::from_str(&env, "first service"),
+            &engineer,
+        );
+        assert_eq!(client.get_last_service_timestamp(&asset_id), Some(t0));
+
+        env.ledger().with_mut(|li| li.timestamp += 500);
+        let t1 = env.ledger().timestamp();
+        client.submit_maintenance(
+            &asset_id,
+            &symbol_short!("FILTER"),
+            &String::from_str(&env, "second service"),
+            &engineer,
+        );
+        assert_eq!(client.get_last_service_timestamp(&asset_id), Some(t1));
     }
 
     // --- Issue #142: NotInitialized structured error ---
