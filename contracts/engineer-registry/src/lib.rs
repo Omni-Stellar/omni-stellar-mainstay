@@ -557,10 +557,11 @@ mod tests {
         client.add_trusted_issuer(&admin, &issuer);
         client.register_engineer(&engineer, &hash, &issuer, &31_536_000);
 
-        // Extend instance TTL first so it survives the ledger advance
+        // Extend both instance and persistent entry TTLs before the ledger advance
         let contract_id = client.address.clone();
         env.as_contract(&contract_id, || {
             env.storage().instance().extend_ttl(1_000_000, 1_000_000);
+            env.storage().persistent().extend_ttl(&engineer_key(&engineer), 1_000_000, 1_000_000);
         });
 
         // Simulate near-expiry of the persistent engineer entry
