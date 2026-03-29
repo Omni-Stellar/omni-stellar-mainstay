@@ -543,6 +543,19 @@ impl Lifecycle {
             .persistent()
             .extend_ttl(&last_update_key(asset_id), 518400, 518400);
 
+        let mut score_history: Vec<ScoreEntry> = env
+            .storage()
+            .persistent()
+            .get(&score_history_key(asset_id))
+            .unwrap_or(Vec::new(&env));
+        score_history.push_back(ScoreEntry {
+            timestamp: current_time,
+            score: new_score,
+        });
+        env.storage()
+            .persistent()
+            .set(&score_history_key(asset_id), &score_history);
+
         env.events().publish(
             (symbol_short!("DECAY"), asset_id),
             (current_score, new_score, current_time),
