@@ -587,6 +587,12 @@ impl Lifecycle {
         );
     }
 
+    /// Returns the current ledger protocol version.
+    /// Used by frontends and backends to verify protocol compatibility with this contract.
+    pub fn get_ledger_version(env: Env) -> u32 {
+        env.ledger().protocol_version()
+    }
+
     pub fn get_config(env: Env) -> Config {
         env.storage()
             .instance()
@@ -1756,5 +1762,15 @@ mod tests {
         assert_eq!(client.get_maintenance_history_page(&asset_id, &10, &2).len(), 0);
         // limit=0 → empty
         assert_eq!(client.get_maintenance_history_page(&asset_id, &0, &0).len(), 0);
+    }
+
+    #[test]
+    fn test_get_ledger_version() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _, _, _) = setup(&env, 0);
+        // protocol_version() returns a u32; just assert the call succeeds and returns a u32
+        let version = client.get_ledger_version();
+        assert_eq!(version, env.ledger().protocol_version());
     }
 }
