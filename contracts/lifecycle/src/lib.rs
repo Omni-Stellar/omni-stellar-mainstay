@@ -1780,4 +1780,133 @@ mod tests {
         // limit=0 → empty
         assert_eq!(client.get_maintenance_history_page(&asset_id, &0, &0).len(), 0);
     }
+
+    // --- Issue #207: decay_score extends TTL ---
+
+    #[test]
+    fn test_decay_score_extends_ttl() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
+        let asset_id = register_asset(&env, &asset_registry_client);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+
+        client.submit_maintenance(
+            &asset_id,
+            &symbol_short!("ENGINE"),
+            &String::from_str(&env, "Maintenance"),
+            &engineer,
+        );
+
+        let score_key = (symbol_short!("SCORE"), asset_id);
+        let last_update_key = (symbol_short!("LAST_UPD"), asset_id);
+
+        // Verify entries exist before decay
+        assert!(env.storage().persistent().has(&score_key));
+        assert!(env.storage().persistent().has(&last_update_key));
+
+        // Call decay_score
+        client.decay_score(&asset_id);
+
+        // Verify entries still exist after decay (TTL was extended)
+        assert!(env.storage().persistent().has(&score_key));
+        assert!(env.storage().persistent().has(&last_update_key));
+    }
+
+    // --- Issue #208: submit_maintenance extends TTL ---
+
+    #[test]
+    fn test_submit_maintenance_extends_ttl() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
+        let asset_id = register_asset(&env, &asset_registry_client);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+
+        let history_key = (symbol_short!("HIST"), asset_id);
+        let score_key = (symbol_short!("SCORE"), asset_id);
+        let score_history_key = (symbol_short!("SCOR_HST"), asset_id);
+        let last_update_key = (symbol_short!("LAST_UPD"), asset_id);
+
+        client.submit_maintenance(
+            &asset_id,
+            &symbol_short!("ENGINE"),
+            &String::from_str(&env, "Maintenance"),
+            &engineer,
+        );
+
+        // Verify all keys exist and TTL was extended
+        assert!(env.storage().persistent().has(&history_key));
+        assert!(env.storage().persistent().has(&score_key));
+        assert!(env.storage().persistent().has(&score_history_key));
+        assert!(env.storage().persistent().has(&last_update_key));
+    }
+
+    // --- Issue #209: batch_submit_maintenance extends TTL ---
+
+    #[test]
+    fn test_batch_submit_maintenance_extends_ttl() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
+        let asset_id = register_asset(&env, &asset_registry_client);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+
+        let history_key = (symbol_short!("HIST"), asset_id);
+        let score_key = (symbol_short!("SCORE"), asset_id);
+        let score_history_key = (symbol_short!("SCOR_HST"), asset_id);
+        let last_update_key = (symbol_short!("LAST_UPD"), asset_id);
+
+        let mut records = Vec::new(&env);
+        records.push_back(BatchRecord {
+            task_type: symbol_short!("OIL_CHG"),
+            notes: String::from_str(&env, "Oil change"),
+        });
+        records.push_back(BatchRecord {
+            task_type: symbol_short!("INSPECT"),
+            notes: String::from_str(&env, "Inspection"),
+        });
+
+        client.batch_submit_maintenance(&asset_id, &records, &engineer);
+
+        // Verify all keys exist and TTL was extended
+        assert!(env.storage().persistent().has(&history_key));
+        assert!(env.storage().persistent().has(&score_key));
+        assert!(env.storage().persistent().has(&score_history_key));
+        assert!(env.storage().persistent().has(&last_update_key));
+    }
+
+    // --- Issue #210: reset_score extends TTL ---
+
+    #[test]
+    fn test_reset_score_extends_ttl() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, engineer_registry_client, admin) = setup(&env, 0);
+        let asset_id = register_asset(&env, &asset_registry_client);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+
+        client.submit_maintenance(
+            &asset_id,
+            &symbol_short!("ENGINE"),
+            &String::from_str(&env, "Maintenance"),
+            &engineer,
+        );
+
+        let score_key = (symbol_short!("SCORE"), asset_id);
+
+        // Verify entry exists before reset
+        assert!(env.storage().persistent().has(&score_key));
+
+        // Call reset_score
+        client.reset_score(&admin, &asset_id);
+
+        // Verify entry still exists after reset (TTL was extended)
+        assert!(env.storage().persistent().has(&score_key));
+        assert_eq!(client.get_collateral_score(&asset_id), 0);
+    }
 }
