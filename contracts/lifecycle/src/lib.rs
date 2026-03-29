@@ -548,7 +548,7 @@ mod tests {
     use soroban_sdk::{
         symbol_short,
         testutils::{Address as _, Events, Ledger},
-        BytesN, Env, String,
+        BytesN, Env, String, TryIntoVal,
     };
 
     fn setup<'a>(
@@ -1417,6 +1417,50 @@ mod tests {
         assert_eq!(last.asset_id, asset_id);
         assert_eq!(last.engineer, engineer);
         assert_eq!(last.task_type, symbol_short!("ENGINE"));
+    }
+
+    #[test]
+    fn test_decay_score_emits_correct_event() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, engineer_registry_client, admin) = setup(&env, 0);
+        let asset_id = register_asset(&env, &asset_registry_client);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+
+        // ENGINE = 10 pts
+        client.submit_maintenance(
+            &asset_id,
+            &symbol_short!("ENGINE"),
+            &String::from_str(&env, ""),
+            &engineer,
+        );
+        let initial_score: u32 = 10;
+
+        // Use fast decay: 3 pts per 60s, advance 60s (1 interval)
+        client.update_decay_config(&admin, &3, &60);
+        env.ledger().with_mut(|li| li.timestamp += 60);
+        let decay_time = env.ledger().timestamp();
+
+        client.decay_score(&asset_id);
+
+        let events = env.events().all();
+        assert_eq!(events.len(), 1);
+
+        let (_, topics, data) = events.get(0).unwrap();
+
+        // Topics: (symbol("DECAY"), asset_id)
+        let t0: Symbol = topics.get(0).unwrap().try_into_val(&env).unwrap();
+        let t1: u64 = topics.get(1).unwrap().try_into_val(&env).unwrap();
+        assert_eq!(t0, symbol_short!("DECAY"));
+        assert_eq!(t1, asset_id);
+
+        // Data: (old_score, new_score, timestamp)
+        let expected_new_score: u32 = initial_score - 3;
+        let (ev_old, ev_new, ev_ts): (u32, u32, u64) = data.try_into_val(&env).unwrap();
+        assert_eq!(ev_old, initial_score);
+        assert_eq!(ev_new, expected_new_score);
+        assert_eq!(ev_ts, decay_time);
     }
 
     #[test]
