@@ -12,7 +12,7 @@ pub enum ContractError {
 }
 
 #[contracttype]
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Engineer {
     pub address: Address,
     pub credential_hash: BytesN<32>,
@@ -218,6 +218,20 @@ mod tests {
         let admin = Address::generate(env);
         client.initialize_admin(&admin);
         (client, admin)
+    }
+
+    #[test]
+    #[should_panic(expected = "admin already initialized")]
+    fn test_initialize_admin_called_twice_panics() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(EngineerRegistry, ());
+        let client = EngineerRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize_admin(&admin);
+        // Second call must panic
+        client.initialize_admin(&admin);
     }
 
     #[test]
@@ -544,7 +558,7 @@ mod tests {
         client.register_engineer(&engineer, &hash, &issuer, &31_536_000);
 
         // Simulate near-expiry by advancing ledger close to TTL threshold
-        env.ledger().with_mut(|li| li.sequence = li.sequence + 518399);
+        env.ledger().with_mut(|li| li.sequence_number = li.sequence_number + 518399);
 
         client.revoke_credential(&engineer);
 
