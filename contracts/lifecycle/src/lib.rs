@@ -498,6 +498,67 @@ impl Lifecycle {
         Self::get_collateral_score(env, asset_id) >= threshold
     }
 
+    pub fn get_asset_registry(env: Env) -> Address {
+        env.storage()
+            .instance()
+            .get(&ASSET_REGISTRY)
+            .expect("asset registry not set")
+    }
+
+    pub fn update_asset_registry(env: Env, admin: Address, new_registry: Address) {
+        admin.require_auth();
+
+        let config: Config = env
+            .storage()
+            .instance()
+            .get(&CONFIG)
+            .expect("config not set");
+        if config.admin != admin {
+            panic_with_error!(&env, ContractError::UnauthorizedAdmin);
+        }
+
+        env.storage().instance().set(&ASSET_REGISTRY, &new_registry);
+
+        env.events().publish(
+            (symbol_short!("UPD_AST"),),
+            (admin, new_registry),
+        );
+    }
+
+    pub fn get_engineer_registry(env: Env) -> Address {
+        env.storage()
+            .instance()
+            .get(&ENG_REGISTRY)
+            .expect("engineer registry not set")
+    }
+
+    pub fn update_engineer_registry(env: Env, admin: Address, new_registry: Address) {
+        admin.require_auth();
+
+        let config: Config = env
+            .storage()
+            .instance()
+            .get(&CONFIG)
+            .expect("config not set");
+        if config.admin != admin {
+            panic_with_error!(&env, ContractError::UnauthorizedAdmin);
+        }
+
+        env.storage().instance().set(&ENG_REGISTRY, &new_registry);
+
+        env.events().publish(
+            (symbol_short!("UPD_ENG"),),
+            (admin, new_registry),
+        );
+    }
+
+    pub fn get_config(env: Env) -> Config {
+        env.storage()
+            .instance()
+            .get(&CONFIG)
+            .expect("config not set")
+    }
+
     /// Admin-only: upgrade the contract WASM to a new hash.
     pub fn upgrade(env: Env, admin: Address, _new_wasm_hash: BytesN<32>) {
         admin.require_auth();
@@ -1573,6 +1634,143 @@ mod tests {
 
         let outsider = Address::generate(&env);
         let result = client.try_reset_score(&outsider, &asset_id);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::UnauthorizedAdmin as u32,
+            ))),
+        );
+    }
+
+    #[test]
+    fn test_get_config_returns_initialized_values() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, _, _, admin) = setup(&env, 50);
+        let config = client.get_config();
+
+        assert_eq!(config.admin, admin);
+        assert_eq!(config.max_history, 50);
+        assert_eq!(config.score_increment, DEFAULT_SCORE_INCREMENT);
+        assert_eq!(config.decay_rate, DEFAULT_DECAY_RATE);
+        assert_eq!(config.decay_interval, DEFAULT_DECAY_INTERVAL);
+    }
+
+    #[test]
+    fn test_get_asset_registry_returns_initialized_address() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let asset_registry_id = env.register(AssetRegistry, ());
+        let engineer_registry_id = env.register(EngineerRegistry, ());
+        let lifecycle_id = env.register(Lifecycle, ());
+        let admin = Address::generate(&env);
+
+        let client = LifecycleClient::new(&env, &lifecycle_id);
+        client.initialize(&asset_registry_id, &engineer_registry_id, &admin, &0);
+
+        assert_eq!(client.get_asset_registry(), asset_registry_id);
+    }
+
+    #[test]
+    fn test_get_engineer_registry_returns_initialized_address() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let asset_registry_id = env.register(AssetRegistry, ());
+        let engineer_registry_id = env.register(EngineerRegistry, ());
+        let lifecycle_id = env.register(Lifecycle, ());
+        let admin = Address::generate(&env);
+
+        let client = LifecycleClient::new(&env, &lifecycle_id);
+        client.initialize(&asset_registry_id, &engineer_registry_id, &admin, &0);
+
+        assert_eq!(client.get_engineer_registry(), engineer_registry_id);
+    }
+
+    #[test]
+    fn test_admin_can_update_asset_registry() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, _, _, admin) = setup(&env, 0);
+        let new_registry = env.register(AssetRegistry, ());
+
+        client.update_asset_registry(&admin, &new_registry);
+
+        assert_eq!(client.get_asset_registry(), new_registry);
+    }
+
+    #[test]
+    fn test_update_asset_registry_emits_event() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, _, _, admin) = setup(&env, 0);
+        let new_registry = env.register(AssetRegistry, ());
+
+        client.update_asset_registry(&admin, &new_registry);
+
+        let events = env.events().all();
+        assert!(events.len() > 0);
+    }
+
+    #[test]
+    fn test_non_admin_cannot_update_asset_registry() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, _, _, _) = setup(&env, 0);
+        let outsider = Address::generate(&env);
+        let new_registry = env.register(AssetRegistry, ());
+
+        let result = client.try_update_asset_registry(&outsider, &new_registry);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::UnauthorizedAdmin as u32,
+            ))),
+        );
+    }
+
+    #[test]
+    fn test_admin_can_update_engineer_registry() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, _, _, admin) = setup(&env, 0);
+        let new_registry = env.register(EngineerRegistry, ());
+
+        client.update_engineer_registry(&admin, &new_registry);
+
+        assert_eq!(client.get_engineer_registry(), new_registry);
+    }
+
+    #[test]
+    fn test_update_engineer_registry_emits_event() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, _, _, admin) = setup(&env, 0);
+        let new_registry = env.register(EngineerRegistry, ());
+
+        client.update_engineer_registry(&admin, &new_registry);
+
+        let events = env.events().all();
+        assert!(events.len() > 0);
+    }
+
+    #[test]
+    fn test_non_admin_cannot_update_engineer_registry() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, _, _, _) = setup(&env, 0);
+        let outsider = Address::generate(&env);
+        let new_registry = env.register(EngineerRegistry, ());
+
+        let result = client.try_update_engineer_registry(&outsider, &new_registry);
         assert_eq!(
             result,
             Err(Ok(soroban_sdk::Error::from_contract_error(
