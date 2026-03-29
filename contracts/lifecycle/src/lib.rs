@@ -407,6 +407,19 @@ impl Lifecycle {
             .persistent()
             .set(&last_update_key(asset_id), &current_time);
 
+        let mut score_history: Vec<ScoreEntry> = env
+            .storage()
+            .persistent()
+            .get(&score_history_key(asset_id))
+            .unwrap_or(Vec::new(&env));
+        score_history.push_back(ScoreEntry {
+            timestamp: current_time,
+            score: new_score,
+        });
+        env.storage()
+            .persistent()
+            .set(&score_history_key(asset_id), &score_history);
+
         env.events().publish(
             (symbol_short!("DECAY"), asset_id),
             (current_score, new_score, current_time),
@@ -827,6 +840,38 @@ mod tests {
         let new_score = client.get_collateral_score(&asset_id);
 
         assert_eq!(new_score, initial_score.saturating_sub(4));
+    }
+
+    #[test]
+    fn test_score_history_includes_decay_entries() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, engineer_registry_client, admin) = setup(&env, 0);
+        let asset_id = register_asset(&env, &asset_registry_client);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+
+        client.submit_maintenance(
+            &asset_id,
+            &symbol_short!("ENGINE"),
+            &String::from_str(&env, "Initial maintenance"),
+            &engineer,
+        );
+
+        client.update_decay_config(&admin, &2, &100);
+        env.ledger().with_mut(|li| li.timestamp = li.timestamp + 250);
+
+        let initial_history = client.get_score_history(&asset_id);
+        assert_eq!(initial_history.len(), 1);
+
+        client.decay_score(&asset_id);
+        let new_score = client.get_collateral_score(&asset_id);
+
+        let history = client.get_score_history(&asset_id);
+        assert_eq!(history.len(), 2);
+        let decay_entry = history.get(1).unwrap();
+        assert_eq!(decay_entry.score, new_score);
+        assert_eq!(decay_entry.timestamp, env.ledger().timestamp());
     }
 
     #[test]
