@@ -14,6 +14,8 @@ pub enum ContractError {
     HistoryCapReached = 4,
     AssetNotFound = 5,
     NotInitialized = 6,
+    AlreadyInitialized = 7,
+    InvalidConfig = 8,
 }
 
 #[contracttype]
@@ -127,6 +129,10 @@ impl Lifecycle {
         admin: Address,
         max_history: u32,
     ) {
+        if env.storage().instance().has(&CONFIG) {
+            panic_with_error!(&env, ContractError::AlreadyInitialized);
+        }
+
         env.storage()
             .instance()
             .set(&ASSET_REGISTRY, &asset_registry);
@@ -156,6 +162,10 @@ impl Lifecycle {
     pub fn update_score_increment(env: Env, admin: Address, score_increment: u32) {
         admin.require_auth();
 
+        if score_increment == 0 {
+            panic_with_error!(&env, ContractError::InvalidConfig);
+        }
+
         let mut config: Config = env
             .storage()
             .instance()
@@ -179,6 +189,10 @@ impl Lifecycle {
         decay_interval: u64,
     ) {
         admin.require_auth();
+
+        if decay_interval == 0 {
+            panic_with_error!(&env, ContractError::InvalidConfig);
+        }
 
         let mut config: Config = env
             .storage()
@@ -537,7 +551,7 @@ impl Lifecycle {
         env.storage()
             .instance()
             .get(&ASSET_REGISTRY)
-            .expect("asset registry not set")
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized))
     }
 
     pub fn update_asset_registry(env: Env, admin: Address, new_registry: Address) {
@@ -547,7 +561,7 @@ impl Lifecycle {
             .storage()
             .instance()
             .get(&CONFIG)
-            .expect("config not set");
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
         if config.admin != admin {
             panic_with_error!(&env, ContractError::UnauthorizedAdmin);
         }
@@ -564,7 +578,7 @@ impl Lifecycle {
         env.storage()
             .instance()
             .get(&ENG_REGISTRY)
-            .expect("engineer registry not set")
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized))
     }
 
     pub fn update_engineer_registry(env: Env, admin: Address, new_registry: Address) {
@@ -574,7 +588,7 @@ impl Lifecycle {
             .storage()
             .instance()
             .get(&CONFIG)
-            .expect("config not set");
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
         if config.admin != admin {
             panic_with_error!(&env, ContractError::UnauthorizedAdmin);
         }
@@ -591,7 +605,7 @@ impl Lifecycle {
         env.storage()
             .instance()
             .get(&CONFIG)
-            .expect("config not set")
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized))
     }
 
     /// Admin-only: upgrade the contract WASM to a new hash.
@@ -846,6 +860,21 @@ mod tests {
     }
 
     #[test]
+    fn test_update_score_increment_zero_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, _, _, admin) = setup(&env, 0);
+        let result = client.try_update_score_increment(&admin, &0);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::InvalidConfig as u32,
+            ))),
+        );
+    }
+
+    #[test]
     fn test_admin_can_update_decay_config() {
         let env = Env::default();
         env.mock_all_auths();
@@ -888,6 +917,21 @@ mod tests {
             result,
             Err(Ok(soroban_sdk::Error::from_contract_error(
                 ContractError::UnauthorizedAdmin as u32,
+            ))),
+        );
+    }
+
+    #[test]
+    fn test_update_decay_config_zero_interval_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, _, _, admin) = setup(&env, 0);
+        let result = client.try_update_decay_config(&admin, &10, &0);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::InvalidConfig as u32,
             ))),
         );
     }
@@ -1019,6 +1063,39 @@ mod tests {
 
         let events = env.events().all();
         assert_eq!(events.len(), 1);
+    }
+
+    #[test]
+    fn test_initialize_twice_panics_with_already_initialized() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let asset_registry_id = env.register(AssetRegistry, ());
+        let engineer_registry_id = env.register(EngineerRegistry, ());
+        let lifecycle_id = env.register(Lifecycle, ());
+        let admin = Address::generate(&env);
+
+        let lifecycle = LifecycleClient::new(&env, &lifecycle_id);
+        lifecycle.initialize(
+            &asset_registry_id,
+            &engineer_registry_id,
+            &admin,
+            &0u32,
+        );
+
+        // Try to initialize again
+        let result = lifecycle.try_initialize(
+            &asset_registry_id,
+            &engineer_registry_id,
+            &admin,
+            &0u32,
+        );
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::AlreadyInitialized as u32,
+            ))),
+        );
     }
 
     #[test]
@@ -1689,6 +1766,95 @@ mod tests {
         let client = LifecycleClient::new(&env, &lifecycle_id);
 
         let result = client.try_get_collateral_score(&1u64);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::NotInitialized as u32,
+            ))),
+        );
+    }
+
+    #[test]
+    fn test_get_asset_registry_before_init_returns_structured_error() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let lifecycle_id = env.register(Lifecycle, ());
+        let client = LifecycleClient::new(&env, &lifecycle_id);
+
+        let result = client.try_get_asset_registry();
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::NotInitialized as u32,
+            ))),
+        );
+    }
+
+    #[test]
+    fn test_get_engineer_registry_before_init_returns_structured_error() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let lifecycle_id = env.register(Lifecycle, ());
+        let client = LifecycleClient::new(&env, &lifecycle_id);
+
+        let result = client.try_get_engineer_registry();
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::NotInitialized as u32,
+            ))),
+        );
+    }
+
+    #[test]
+    fn test_get_config_before_init_returns_structured_error() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let lifecycle_id = env.register(Lifecycle, ());
+        let client = LifecycleClient::new(&env, &lifecycle_id);
+
+        let result = client.try_get_config();
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::NotInitialized as u32,
+            ))),
+        );
+    }
+
+    #[test]
+    fn test_update_asset_registry_before_init_returns_structured_error() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let lifecycle_id = env.register(Lifecycle, ());
+        let client = LifecycleClient::new(&env, &lifecycle_id);
+        let admin = Address::generate(&env);
+        let new_registry = Address::generate(&env);
+
+        let result = client.try_update_asset_registry(&admin, &new_registry);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::NotInitialized as u32,
+            ))),
+        );
+    }
+
+    #[test]
+    fn test_update_engineer_registry_before_init_returns_structured_error() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let lifecycle_id = env.register(Lifecycle, ());
+        let client = LifecycleClient::new(&env, &lifecycle_id);
+        let admin = Address::generate(&env);
+        let new_registry = Address::generate(&env);
+
+        let result = client.try_update_engineer_registry(&admin, &new_registry);
         assert_eq!(
             result,
             Err(Ok(soroban_sdk::Error::from_contract_error(
