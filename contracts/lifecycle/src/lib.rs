@@ -856,8 +856,6 @@ impl Lifecycle {
         apply_decay(&env, asset_id, false, false)
     }
 
-pub fn is_collateral_eligible(env: Env, asset_id: u64) -> bool {
-        Self::get_collateral_score(env, asset_id) >= 50
     /// Returns the full score trend: one (timestamp, score) entry per maintenance event.
     /// Get the complete score history for an asset.
     /// Returns one (timestamp, score) entry per maintenance event.
@@ -934,7 +932,7 @@ pub fn is_collateral_eligible(env: Env, asset_id: u64) -> bool {
             .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
         
         // Use unchecked version since we already verified asset exists
-        Self::get_collateral_score_unchecked(&env, asset_id) >= config.eligibility_threshold
+        apply_decay(&env, asset_id, false, false) >= config.eligibility_threshold
     }
 
     /// Get the address of the asset registry contract.
@@ -1180,8 +1178,24 @@ pub fn is_collateral_eligible(env: Env, asset_id: u64) -> bool {
         );
     }
 
+    /// Check collateral eligibility for multiple assets in a single call.
+    ///
+    /// # Arguments
+    /// * `asset_ids` - Vec of asset IDs to check
+    ///
+    /// # Returns
+    /// Vec of `bool` in the same order as `asset_ids`; each entry is `true` if
+    /// the corresponding asset meets the eligibility threshold.
+    ///
+    /// # Panics
+    /// - [`ContractError::NotInitialized`] if contract has not been initialized
+    /// - [`ContractError::AssetNotFound`] if any asset ID does not exist
     pub fn batch_is_collateral_eligible(env: Env, asset_ids: Vec<u64>) -> Vec<bool> {
-        asset_ids.iter().map(|&id| Self::is_collateral_eligible(env.clone(), id)).collect()
+        let mut results: Vec<bool> = Vec::new(&env);
+        for asset_id in asset_ids.iter() {
+            results.push_back(Self::is_collateral_eligible(env.clone(), asset_id));
+        }
+        results
     }
 }
 
@@ -1955,6 +1969,72 @@ for _ in 0..3 {
             result,
             Err(Ok(soroban_sdk::Error::from_contract_error(
                 ContractError::UnauthorizedAdmin as u32,
+            ))),
+        );
+    }
+
+    #[test]
+    fn test_batch_is_collateral_eligible_mixed() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+
+        // asset_a: 5 × ENGINE (10 pts each) = 50 → eligible
+        let asset_a = register_asset(&env, &asset_registry_client);
+        for _ in 0..5 {
+            client.submit_maintenance(
+                &asset_a,
+                &symbol_short!("ENGINE"),
+                &String::from_str(&env, ""),
+                &engineer,
+            );
+        }
+
+        // asset_b: 1 × OIL_CHG (2 pts) → not eligible
+        let asset_b = register_asset(&env, &asset_registry_client);
+        client.submit_maintenance(
+            &asset_b,
+            &symbol_short!("OIL_CHG"),
+            &String::from_str(&env, ""),
+            &engineer,
+        );
+
+        let mut ids = Vec::new(&env);
+        ids.push_back(asset_a);
+        ids.push_back(asset_b);
+
+        let results = client.batch_is_collateral_eligible(&ids);
+        assert_eq!(results.len(), 2);
+        assert!(results.get(0).unwrap());
+        assert!(!results.get(1).unwrap());
+    }
+
+    #[test]
+    fn test_batch_is_collateral_eligible_empty_input() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, _, _, _) = setup(&env, 0);
+        let results = client.batch_is_collateral_eligible(&Vec::new(&env));
+        assert_eq!(results.len(), 0);
+    }
+
+    #[test]
+    fn test_batch_is_collateral_eligible_unknown_asset_returns_error() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, _, _, _) = setup(&env, 0);
+        let mut ids = Vec::new(&env);
+        ids.push_back(999u64);
+
+        let result = client.try_batch_is_collateral_eligible(&ids);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                asset_registry::ContractError::AssetNotFound as u32,
             ))),
         );
     }
