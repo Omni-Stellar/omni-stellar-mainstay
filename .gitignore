@@ -1,2 +1,16 @@
 /target
-TODO.md
+
+# Test snapshots
+**/test_snapshots/
+
+# Environment files
+.env
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Logs
+*.log
