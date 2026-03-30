@@ -1,5 +1,9 @@
 # omni-stellar-omni-stellar-mainstay — Proof of Maintenance for Industrial Assets
 
+[![CI](https://github.com/marvs8/omni-stellar-omni-stellar-mainstay/actions/workflows/ci.yml/badge.svg)](https://github.com/marvs8/omni-stellar-omni-stellar-mainstay/actions/workflows/ci.yml)
+[![Clippy](https://img.shields.io/badge/clippy-passing-brightgreen)](https://github.com/marvs8/omni-stellar-omni-stellar-mainstay/actions/workflows/ci.yml)
+[![rustfmt](https://img.shields.io/badge/rustfmt-passing-brightgreen)](https://github.com/marvs8/omni-stellar-omni-stellar-mainstay/actions/workflows/ci.yml)
+
 A decentralized physical infrastructure network (DePIN) built on Stellar Soroban smart contracts, creating verifiable maintenance audit trails for heavy industrial machinery.
 
 omni-stellar-omni-stellar-mainstay solves the **Information Asymmetry** problem in asset financing — lenders don't know the true physical condition of a machine. By anchoring every maintenance event on-chain, omni-stellar-omni-stellar-mainstay creates an immutable, verifiable lifecycle record that transforms industrial assets into credible DeFi collateral.
