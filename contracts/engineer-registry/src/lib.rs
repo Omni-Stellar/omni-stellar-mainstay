@@ -1,5 +1,8 @@
 #![no_std]
-use soroban_sdk::{contract, contractimpl, contracttype, contracterror, panic_with_error, symbol_short, Address, BytesN, Env, Symbol, Vec};
+use soroban_sdk::{
+    contract, contracterror, contractimpl, contracttype, panic_with_error, symbol_short, Address,
+    BytesN, Env, Symbol, Vec,
+};
 
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -12,6 +15,7 @@ pub enum ContractError {
     AdminAlreadyInitialized = 5,
     UntrustedIssuer = 6,
     InvalidCredentialHash = 7,
+    Paused = 8,
 }
 
 #[contracttype]
@@ -27,6 +31,18 @@ pub struct Engineer {
 
 fn engineer_key(addr: &Address) -> (Symbol, Address) {
     (symbol_short!("ENG"), addr.clone())
+}
+
+const PAUSED_KEY: Symbol = symbol_short!("PAUSED");
+
+fn is_paused(env: &Env) -> bool {
+    env.storage().instance().get(&PAUSED_KEY).unwrap_or(false)
+}
+
+fn ensure_not_paused(env: &Env) {
+    if is_paused(env) {
+        panic_with_error!(env, ContractError::Paused);
+    }
 }
 
 fn admin_key() -> Symbol {
@@ -69,6 +85,7 @@ impl EngineerRegistry {
         issuer: Address,
         validity_period: u64,
     ) {
+        ensure_not_paused(&env);
         issuer.require_auth();
         if !env.storage().instance().has(&trusted_key(&issuer)) {
             panic_with_error!(&env, ContractError::UntrustedIssuer);
@@ -139,6 +156,7 @@ impl EngineerRegistry {
     /// - [`ContractError::EngineerNotFound`] if no engineer exists with the given address
     /// - [`ContractError::CredentialAlreadyRevoked`] if the credentials are already revoked
     pub fn revoke_credential(env: Env, engineer: Address) {
+        ensure_not_paused(&env);
         let mut record: Engineer = env
             .storage()
             .persistent()
@@ -207,6 +225,40 @@ impl EngineerRegistry {
             .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized))
     }
 
+    /// Admin-only function to pause the contract.
+    ///
+    /// # Arguments
+    /// * `admin` - The address that must match the stored admin
+    pub fn pause(env: Env, admin: Address) {
+        admin.require_auth();
+        let stored_admin: Address = Self::get_admin(env.clone());
+        if stored_admin != admin {
+            panic_with_error!(&env, ContractError::UnauthorizedAdmin);
+        }
+        env.storage().instance().set(&PAUSED_KEY, &true);
+    }
+
+    /// Admin-only function to unpause the contract.
+    ///
+    /// # Arguments
+    /// * `admin` - The address that must match the stored admin
+    pub fn unpause(env: Env, admin: Address) {
+        admin.require_auth();
+        let stored_admin: Address = Self::get_admin(env.clone());
+        if stored_admin != admin {
+            panic_with_error!(&env, ContractError::UnauthorizedAdmin);
+        }
+        env.storage().instance().set(&PAUSED_KEY, &false);
+    }
+
+    /// Check if the contract is currently paused.
+    ///
+    /// # Returns
+    /// `true` if paused; `false` otherwise
+    pub fn is_paused(env: Env) -> bool {
+        is_paused(&env)
+    }
+
     /// Check if an issuer is in the trusted issuers list.
     ///
     /// # Arguments
@@ -240,6 +292,7 @@ impl EngineerRegistry {
     /// - [`ContractError::NotInitialized`] if the admin has not been initialized
     /// - [`ContractError::UnauthorizedAdmin`] if caller is not the admin
     pub fn add_trusted_issuer(env: Env, admin: Address, issuer: Address) {
+        ensure_not_paused(&env);
         admin.require_auth();
         let stored_admin: Address = env.storage().instance().get(&admin_key())
             .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
@@ -270,6 +323,7 @@ impl EngineerRegistry {
     /// - [`ContractError::NotInitialized`] if the admin has not been initialized
     /// - [`ContractError::UnauthorizedAdmin`] if caller is not the admin
     pub fn remove_trusted_issuer(env: Env, admin: Address, issuer: Address) {
+        ensure_not_paused(&env);
         admin.require_auth();
         let stored_admin: Address = env.storage().instance().get(&admin_key())
             .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
@@ -312,6 +366,7 @@ impl EngineerRegistry {
     /// - [`ContractError::NotInitialized`] if the admin has not been initialized
     /// - [`ContractError::UnauthorizedAdmin`] if caller is not the admin
     pub fn upgrade(env: Env, admin: Address, _new_wasm_hash: BytesN<32>) {
+        ensure_not_paused(&env);
         admin.require_auth();
 
         let stored_admin: Address = env
@@ -341,6 +396,20 @@ mod tests {
         let admin = Address::generate(env);
         client.initialize_admin(&admin);
         (client, admin)
+    }
+
+    #[test]
+    #[should_panic(expected = "admin already initialized")]
+    fn test_initialize_admin_called_twice_panics() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(EngineerRegistry, ());
+        let client = EngineerRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize_admin(&admin);
+        // Second call must panic
+        client.initialize_admin(&admin);
     }
 
     #[test]
@@ -525,7 +594,12 @@ mod tests {
         let new_wasm_hash = BytesN::from_array(&env, &[0xabu8; 32]);
         // In test env the WASM hash won't exist, so we just verify auth passes (no UnauthorizedAdmin error)
         let result = client.try_upgrade(&admin, &new_wasm_hash);
-        assert!(result != Err(Ok(soroban_sdk::Error::from_contract_error(ContractError::UnauthorizedAdmin as u32))));
+        assert!(
+            result
+                != Err(Ok(soroban_sdk::Error::from_contract_error(
+                    ContractError::UnauthorizedAdmin as u32
+                )))
+        );
     }
 
     #[test]
@@ -615,8 +689,39 @@ mod tests {
 
         assert_eq!(client.get_engineers_by_issuer(&issuer_a).len(), 1);
         assert_eq!(client.get_engineers_by_issuer(&issuer_b).len(), 1);
-        assert_eq!(client.get_engineers_by_issuer(&issuer_a).get(0).unwrap(), e1);
-        assert_eq!(client.get_engineers_by_issuer(&issuer_b).get(0).unwrap(), e2);
+        assert_eq!(
+            client.get_engineers_by_issuer(&issuer_a).get(0).unwrap(),
+            e1
+        );
+        assert_eq!(
+            client.get_engineers_by_issuer(&issuer_b).get(0).unwrap(),
+            e2
+        );
+    }
+
+    #[test]
+    fn test_pause_and_unpause_in_engineer_registry() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin) = setup(&env);
+
+        let engineer = Address::generate(&env);
+        let issuer = Address::generate(&env);
+        let hash = BytesN::from_array(&env, &[1u8; 32]);
+
+        client.pause(&admin);
+        let result = client.try_register_engineer(&engineer, &hash, &issuer, &31_536_000);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::Paused as u32
+            ))),
+        );
+
+        client.unpause(&admin);
+        client.add_trusted_issuer(&admin, &issuer);
+        client.register_engineer(&engineer, &hash, &issuer, &31_536_000);
+        assert!(client.verify_engineer(&engineer));
     }
 
     #[test]
@@ -753,7 +858,6 @@ mod tests {
         let record = client.get_engineer(&engineer);
         assert!(!record.active);
 
-        let contract_id = client.address.clone();
         let ttl = env.as_contract(&contract_id, || {
             env.storage().persistent().get_ttl(&engineer_key(&engineer))
         });
@@ -782,5 +886,51 @@ mod tests {
 
         let (emitted_issuer,): (Address,) = data.try_into_val(&env).unwrap();
         assert_eq!(emitted_issuer, issuer);
+    }
+
+    #[test]
+    fn test_pause_affects_all_state_changes() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin) = setup(&env);
+
+        let engineer = Address::generate(&env);
+        let issuer = Address::generate(&env);
+        let hash = BytesN::from_array(&env, &[1u8; 32]);
+
+        client.add_trusted_issuer(&admin, &issuer);
+        client.register_engineer(&engineer, &hash, &issuer, &31_536_000);
+
+        client.pause(&admin);
+
+        // register_engineer
+        assert_eq!(
+            client.try_register_engineer(&Address::generate(&env), &hash, &issuer, &100),
+            Err(Ok(soroban_sdk::Error::from_contract_error(ContractError::Paused as u32)))
+        );
+
+        // revoke_credential
+        assert_eq!(
+            client.try_revoke_credential(&engineer),
+            Err(Ok(soroban_sdk::Error::from_contract_error(ContractError::Paused as u32)))
+        );
+
+        // add_trusted_issuer
+        assert_eq!(
+            client.try_add_trusted_issuer(&admin, &Address::generate(&env)),
+            Err(Ok(soroban_sdk::Error::from_contract_error(ContractError::Paused as u32)))
+        );
+
+        // remove_trusted_issuer
+        assert_eq!(
+            client.try_remove_trusted_issuer(&admin, &issuer),
+            Err(Ok(soroban_sdk::Error::from_contract_error(ContractError::Paused as u32)))
+        );
+
+        // upgrade
+        assert_eq!(
+            client.try_upgrade(&admin, &BytesN::from_array(&env, &[0u8; 32])),
+            Err(Ok(soroban_sdk::Error::from_contract_error(ContractError::Paused as u32)))
+        );
     }
 }
