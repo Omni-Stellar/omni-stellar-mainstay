@@ -366,6 +366,12 @@ impl EngineerRegistry {
         if stored_admin != admin {
             panic_with_error!(&env, ContractError::UnauthorizedAdmin);
         }
+        
+        // Check if issuer exists before removing
+        if !env.storage().instance().has(&trusted_key(&issuer)) {
+            panic_with_error!(&env, ContractError::IssuerNotFound);
+        }
+        
         env.storage().instance().remove(&trusted_key(&issuer));
         let list: Vec<Address> = env.storage().instance().get(&issuer_list_key()).unwrap_or(Vec::new(&env));
         let mut new_list: Vec<Address> = Vec::new(&env);
@@ -1188,5 +1194,17 @@ mod tests {
             env.storage().persistent().get_ttl(&engineer_key(&engineer))
         });
         assert!(ttl > 0, "TTL should be extended after renewal");
+    }
+
+    #[test]
+    fn test_remove_nonexistent_issuer() {
+        let env = Env::default();
+        let (client, admin) = setup(&env);
+        let nonexistent_issuer = Address::generate(&env);
+
+        assert_eq!(
+            client.try_remove_trusted_issuer(&admin, &nonexistent_issuer),
+            Err(Ok(soroban_sdk::Error::from_contract_error(ContractError::IssuerNotFound as u32)))
+        );
     }
 }
