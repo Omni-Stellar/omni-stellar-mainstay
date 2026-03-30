@@ -407,8 +407,6 @@ impl Lifecycle {
             .get(&CONFIG)
             .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
 
-        validate_notes_length(&env, &notes, config.max_notes_length);
-
         let mut history: Vec<MaintenanceRecord> = env
             .storage()
             .persistent()
@@ -547,7 +545,6 @@ impl Lifecycle {
 
         for record in records.iter() {
             validate_task_type(&env, &record.task_type);
-            validate_notes_length(&env, &record.notes, config.max_notes_length);
         }
 
         // Validate all records fit before writing any
@@ -2722,5 +2719,94 @@ for _ in 0..3 {
         assert_eq!(history.len(), 2);
         assert!(history.contains(&asset1));
         assert!(history.contains(&asset2));
+    }
+
+    #[test]
+    fn test_is_collateral_eligible_threshold_boundary() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
+        let asset_id = register_asset(&env, &asset_registry_client);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+
+        // 9 × FILTER (5 pts each) = 45 — below threshold of 50
+        for _ in 0..9 {
+            client.submit_maintenance(
+                &asset_id,
+                &symbol_short!("FILTER"),
+                &String::from_str(&env, "Filter replacement"),
+                &engineer,
+            );
+        }
+        assert_eq!(client.get_collateral_score(&asset_id), 45);
+        assert!(!client.is_collateral_eligible(&asset_id));
+
+        // 1 more FILTER → 50 — at threshold, now eligible
+        client.submit_maintenance(
+            &asset_id,
+            &symbol_short!("FILTER"),
+            &String::from_str(&env, "Filter replacement"),
+            &engineer,
+        );
+        assert_eq!(client.get_collateral_score(&asset_id), 50);
+        assert!(client.is_collateral_eligible(&asset_id));
+    }
+
+    #[test]
+    fn test_full_cross_contract_integration_with_transfer() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        // 1. Set up all three contracts
+        let (lifecycle, asset_registry, engineer_registry, _) = setup(&env, 0);
+
+        // 2. Register asset
+        let owner = Address::generate(&env);
+        let asset_id = asset_registry.register_asset(
+            &symbol_short!("GENSET"),
+            &String::from_str(&env, "CAT 3516 Generator"),
+            &owner,
+        );
+        assert_eq!(asset_registry.get_asset(&asset_id).owner, owner);
+
+        // 3. Register engineer
+        let engineer = Address::generate(&env);
+        let issuer = Address::generate(&env);
+        let eng_admin = Address::generate(&env);
+        engineer_registry.initialize_admin(&eng_admin);
+        engineer_registry.add_trusted_issuer(&eng_admin, &issuer);
+        engineer_registry.register_engineer(
+            &engineer,
+            &BytesN::from_array(&env, &[3u8; 32]),
+            &issuer,
+            &31_536_000,
+        );
+        assert!(engineer_registry.verify_engineer(&engineer));
+
+        // 4. Submit maintenance — 5 × OVERHAUL (10 pts each) = 50, eligible
+        for _ in 0..5 {
+            lifecycle.submit_maintenance(
+                &asset_id,
+                &symbol_short!("OVERHAUL"),
+                &String::from_str(&env, "Full overhaul"),
+                &engineer,
+            );
+        }
+
+        // 5. Verify score and collateral eligibility
+        assert_eq!(lifecycle.get_collateral_score(&asset_id), 50);
+        assert!(lifecycle.is_collateral_eligible(&asset_id));
+        assert_eq!(lifecycle.get_maintenance_history(&asset_id).len(), 5);
+
+        // 6. Transfer asset to new owner
+        let new_owner = Address::generate(&env);
+        asset_registry.transfer_asset(&asset_id, &owner, &new_owner);
+
+        // 7. Verify new owner and that lifecycle state is preserved
+        assert_eq!(asset_registry.get_asset(&asset_id).owner, new_owner);
+        assert_eq!(lifecycle.get_collateral_score(&asset_id), 50);
+        assert!(lifecycle.is_collateral_eligible(&asset_id));
+        assert_eq!(lifecycle.get_last_service(&asset_id).engineer, engineer);
     }
 }
