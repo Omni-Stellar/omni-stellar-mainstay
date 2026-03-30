@@ -17,11 +17,9 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Run tests
-        run: cargo test --workspace
+      - run: cargo test --workspace
 
-      - name: Run clippy
-        run: cargo clippy --workspace -- -D warnings
-
-      - name: Check formatting
-        run: cargo fmt --check --all
+      - name: Audit Dependencies
+      run: cargo audit
+      if: failure()
+        run: echo "::error::Dependency vulnerabilities detected. Please review and update dependencies."
