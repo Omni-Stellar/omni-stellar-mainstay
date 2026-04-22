@@ -309,7 +309,7 @@ impl Lifecycle {
         ensure_not_paused(&env);
         admin.require_auth();
 
-        if decay_interval == 0 {
+        if decay_rate == 0 || decay_interval == 0 {
             panic_with_error!(&env, ContractError::InvalidConfig);
         }
 
@@ -1360,6 +1360,21 @@ mod tests {
 
         let (client, _, _, admin) = setup(&env, 0);
         let result = client.try_update_decay_config(&admin, &10, &0);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::InvalidConfig as u32,
+            ))),
+        );
+    }
+
+    #[test]
+    fn test_update_decay_config_zero_rate_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, _, _, admin) = setup(&env, 0);
+        let result = client.try_update_decay_config(&admin, &0, &2592000);
         assert_eq!(
             result,
             Err(Ok(soroban_sdk::Error::from_contract_error(
