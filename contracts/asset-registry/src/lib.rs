@@ -16,6 +16,7 @@ pub enum ContractError {
     NotInitialized = 5,
     AdminAlreadyInitialized = 6,
     Paused = 7,
+    PendingAdminAlreadyExists = 8,
 }
 
 #[contracttype]
@@ -40,6 +41,7 @@ const ASSET_COUNT: Symbol = symbol_short!("A_COUNT");
 const PAUSED_KEY: Symbol = symbol_short!("PAUSED");
 
 const ADMIN_KEY: Symbol = symbol_short!("ADMIN");
+const PENDING_ADMIN_KEY: Symbol = symbol_short!("PEND_ADM");
 
 
 #[contracterror]
@@ -247,6 +249,35 @@ impl AssetRegistry {
             .unwrap_or_else(|| Vec::new(&env))
     }
 
+    /// Returns a paginated list of asset IDs owned by the given address.
+    ///
+    /// # Arguments
+    /// * `owner` - The address of the asset owner
+    /// * `offset` - Starting index for pagination
+    /// * `limit` - Maximum number of asset IDs to return
+    ///
+    /// # Returns
+    /// Vec containing the requested page of asset IDs
+    pub fn get_assets_by_owner_page(env: Env, owner: Address, offset: u32, limit: u32) -> Vec<u64> {
+        let all_assets: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&owner_index_key(&owner))
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let len = all_assets.len();
+        if offset >= len || limit == 0 {
+            return Vec::new(&env);
+        }
+
+        let end = (offset + limit).min(len);
+        let mut page = Vec::new(&env);
+        for i in offset..end {
+            page.push_back(all_assets.get(i).unwrap());
+        }
+        page
+    }
+
     /// Get the total count of registered assets in the system.
     ///
     /// # Returns
@@ -281,6 +312,45 @@ impl AssetRegistry {
     pub fn get_admin(env: Env) -> Address {
         env.storage().instance().get(&ADMIN_KEY)
             .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized))
+    }
+
+    /// Propose a new admin address (step 1 of 2-step transfer).
+    /// Only the current admin can propose a new admin.
+    ///
+    /// # Arguments
+    /// * `admin` - The current admin address
+    /// * `new_admin` - The address to propose as the new admin
+    ///
+    /// # Panics
+    /// - [`ContractError::UnauthorizedAdmin`] if caller is not the current admin
+    /// - [`ContractError::PendingAdminAlreadyExists`] if a pending admin already exists
+    pub fn propose_admin(env: Env, admin: Address, new_admin: Address) {
+        admin.require_auth();
+        let stored_admin: Address = Self::get_admin(env.clone());
+        if stored_admin != admin {
+            panic_with_error!(&env, ContractError::UnauthorizedAdmin);
+        }
+        if env.storage().instance().has(&PENDING_ADMIN_KEY) {
+            panic_with_error!(&env, ContractError::PendingAdminAlreadyExists);
+        }
+        env.storage().instance().set(&PENDING_ADMIN_KEY, &new_admin);
+    }
+
+    /// Accept the admin transfer (step 2 of 2-step transfer).
+    /// Only the pending admin can accept and become the new admin.
+    ///
+    /// # Panics
+    /// - [`ContractError::NotInitialized`] if no pending admin exists
+    /// - [`ContractError::UnauthorizedAdmin`] if caller is not the pending admin
+    pub fn accept_admin(env: Env) {
+        let pending_admin: Address = env
+            .storage()
+            .instance()
+            .get(&PENDING_ADMIN_KEY)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
+        pending_admin.require_auth();
+        env.storage().instance().set(&ADMIN_KEY, &pending_admin);
+        env.storage().instance().remove(&PENDING_ADMIN_KEY);
     }
 
     /// Admin-only function to pause the contract.
@@ -1329,6 +1399,118 @@ mod tests {
             Err(Ok(soroban_sdk::Error::from_contract_error(
                 ContractError::DuplicateAsset as u32,
             ))),
+        );
+    }
+
+    #[test]
+    fn test_get_assets_by_owner_page() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let owner = Address::generate(&env);
+        let mut ids = Vec::new(&env);
+
+        // Register 5 assets
+        for i in 0..5 {
+            let id = client.register_asset(
+                &symbol_short!("GENSET"),
+                &String::from_str(&env, &format!("Asset {}", i)),
+                &owner,
+            );
+            ids.push_back(id);
+        }
+
+        // Test pagination
+        let page1 = client.get_assets_by_owner_page(&owner, &0, &2);
+        assert_eq!(page1.len(), 2);
+        assert_eq!(page1.get(0).unwrap(), ids.get(0).unwrap());
+        assert_eq!(page1.get(1).unwrap(), ids.get(1).unwrap());
+
+        let page2 = client.get_assets_by_owner_page(&owner, &2, &2);
+        assert_eq!(page2.len(), 2);
+        assert_eq!(page2.get(0).unwrap(), ids.get(2).unwrap());
+        assert_eq!(page2.get(1).unwrap(), ids.get(3).unwrap());
+
+        let page3 = client.get_assets_by_owner_page(&owner, &4, &2);
+        assert_eq!(page3.len(), 1);
+        assert_eq!(page3.get(0).unwrap(), ids.get(4).unwrap());
+    }
+
+    #[test]
+    fn test_get_assets_by_owner_page_out_of_bounds() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let owner = Address::generate(&env);
+        client.register_asset(&symbol_short!("GENSET"), &String::from_str(&env, "Asset 1"), &owner);
+
+        // Offset beyond list
+        let page = client.get_assets_by_owner_page(&owner, &10, &2);
+        assert_eq!(page.len(), 0);
+
+        // Limit of 0
+        let page = client.get_assets_by_owner_page(&owner, &0, &0);
+        assert_eq!(page.len(), 0);
+    }
+
+    #[test]
+    fn test_propose_and_accept_admin() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize_admin(&admin);
+
+        let new_admin = Address::generate(&env);
+        client.propose_admin(&admin, &new_admin);
+        client.accept_admin();
+
+        assert_eq!(client.get_admin(), new_admin);
+    }
+
+    #[test]
+    fn test_propose_admin_unauthorized() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize_admin(&admin);
+
+        let unauthorized = Address::generate(&env);
+        let new_admin = Address::generate(&env);
+
+        assert_eq!(
+            client.try_propose_admin(&unauthorized, &new_admin),
+            Err(Ok(soroban_sdk::Error::from_contract_error(ContractError::UnauthorizedAdmin as u32)))
+        );
+    }
+
+    #[test]
+    fn test_accept_admin_unauthorized() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize_admin(&admin);
+
+        let new_admin = Address::generate(&env);
+        client.propose_admin(&admin, &new_admin);
+
+        // Try to accept as unauthorized address
+        env.mock_all_auths_allowing_non_root_auth();
+        assert_eq!(
+            client.try_accept_admin(),
+            Err(Ok(soroban_sdk::Error::from_contract_error(ContractError::UnauthorizedAdmin as u32)))
         );
     }
 }
