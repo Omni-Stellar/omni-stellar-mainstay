@@ -18,6 +18,7 @@ pub enum ContractError {
     InvalidConfig = 8,
     Paused = 9,
     InvalidTaskType = 10,
+    PendingAdminAlreadyExists = 11,
 }
 
 #[contracttype]
@@ -60,6 +61,7 @@ const ASSET_REGISTRY: Symbol = symbol_short!("REGISTRY");
 const ENG_REGISTRY: Symbol = symbol_short!("ENG_REG");
 const CONFIG: Symbol = symbol_short!("CONFIG");
 const PAUSED_KEY: Symbol = symbol_short!("PAUSED");
+const PENDING_ADMIN_KEY: Symbol = symbol_short!("PEND_ADM");
 const DEFAULT_MAX_HISTORY: u32 = 200;
 const DEFAULT_SCORE_INCREMENT: u32 = 5;
 const DEFAULT_DECAY_RATE: u32 = 5;
@@ -254,6 +256,57 @@ impl Lifecycle {
     /// `true` if paused; `false` otherwise
     pub fn is_paused(env: Env) -> bool {
         is_paused(&env)
+    }
+
+    /// Propose a new admin address (step 1 of 2-step transfer).
+    /// Only the current admin can propose a new admin.
+    ///
+    /// # Arguments
+    /// * `admin` - The current admin address
+    /// * `new_admin` - The address to propose as the new admin
+    ///
+    /// # Panics
+    /// - [`ContractError::NotInitialized`] if contract has not been initialized
+    /// - [`ContractError::UnauthorizedAdmin`] if caller is not the current admin
+    /// - [`ContractError::PendingAdminAlreadyExists`] if a pending admin already exists
+    pub fn propose_admin(env: Env, admin: Address, new_admin: Address) {
+        admin.require_auth();
+        let config: Config = env
+            .storage()
+            .instance()
+            .get(&CONFIG)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
+        if config.admin != admin {
+            panic_with_error!(&env, ContractError::UnauthorizedAdmin);
+        }
+        if env.storage().instance().has(&PENDING_ADMIN_KEY) {
+            panic_with_error!(&env, ContractError::PendingAdminAlreadyExists);
+        }
+        env.storage().instance().set(&PENDING_ADMIN_KEY, &new_admin);
+    }
+
+    /// Accept the admin transfer (step 2 of 2-step transfer).
+    /// Only the pending admin can accept and become the new admin.
+    ///
+    /// # Panics
+    /// - [`ContractError::NotInitialized`] if no pending admin exists
+    /// - [`ContractError::UnauthorizedAdmin`] if caller is not the pending admin
+    pub fn accept_admin(env: Env) {
+        let pending_admin: Address = env
+            .storage()
+            .instance()
+            .get(&PENDING_ADMIN_KEY)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
+        pending_admin.require_auth();
+
+        let mut config: Config = env
+            .storage()
+            .instance()
+            .get(&CONFIG)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
+        config.admin = pending_admin;
+        env.storage().instance().set(&CONFIG, &config);
+        env.storage().instance().remove(&PENDING_ADMIN_KEY);
     }
 
     /// Admin-only function to update the score increment configuration.
@@ -2585,5 +2638,54 @@ mod tests {
         assert_eq!(history.len(), 2);
         assert!(history.contains(&asset1));
         assert!(history.contains(&asset2));
+    }
+
+    #[test]
+    fn test_propose_and_accept_admin() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, _, _, admin) = setup(&env, 0);
+        let new_admin = Address::generate(&env);
+
+        client.propose_admin(&admin, &new_admin);
+        client.accept_admin();
+
+        // Verify new admin is set by checking they can pause
+        client.pause(&new_admin);
+        assert!(client.is_paused());
+    }
+
+    #[test]
+    fn test_propose_admin_unauthorized() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, _, _, admin) = setup(&env, 0);
+        let unauthorized = Address::generate(&env);
+        let new_admin = Address::generate(&env);
+
+        assert_eq!(
+            client.try_propose_admin(&unauthorized, &new_admin),
+            Err(Ok(soroban_sdk::Error::from_contract_error(ContractError::UnauthorizedAdmin as u32)))
+        );
+    }
+
+    #[test]
+    fn test_accept_admin_unauthorized() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, _, _, admin) = setup(&env, 0);
+        let new_admin = Address::generate(&env);
+
+        client.propose_admin(&admin, &new_admin);
+
+        // Try to accept as unauthorized address
+        env.mock_all_auths_allowing_non_root_auth();
+        assert_eq!(
+            client.try_accept_admin(),
+            Err(Ok(soroban_sdk::Error::from_contract_error(ContractError::UnauthorizedAdmin as u32)))
+        );
     }
 }
