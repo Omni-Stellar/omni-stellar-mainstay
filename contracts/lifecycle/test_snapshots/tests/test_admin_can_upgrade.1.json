@@ -176,6 +176,14 @@
                             },
                             {
                               "key": {
+                                "symbol": "max_notes_length"
+                              },
+                              "val": {
+                                "u32": 256
+                              }
+                            },
+                            {
+                              "key": {
                                 "symbol": "score_increment"
                               },
                               "val": {
@@ -267,5 +275,29 @@
       ]
     ]
   },
-  "events": []
+  "events": [
+    {
+      "event": {
+        "ext": "v0",
+        "contract_id": "0000000000000000000000000000000000000000000000000000000000000003",
+        "type_": "contract",
+        "body": {
+          "v0": {
+            "topics": [
+              {
+                "symbol": "UPGRADE"
+              },
+              {
+                "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4"
+              }
+            ],
+            "data": {
+              "bytes": "abababababababababababababababababababababababababababababababab"
+            }
+          }
+        }
+      },
+      "failed_call": false
+    }
+  ]
 }
