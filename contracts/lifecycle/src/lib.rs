@@ -676,6 +676,9 @@ impl Lifecycle {
         env.storage()
             .persistent()
             .set(&score_history_key(asset_id), &score_history);
+        env.storage()
+            .persistent()
+            .extend_ttl(&score_history_key(asset_id), 518400, 518400);
 
         env.events().publish(
             (symbol_short!("DECAY"), asset_id),
@@ -2466,6 +2469,7 @@ mod tests {
 
         let score_key = (symbol_short!("SCORE"), asset_id);
         let last_update_key = (symbol_short!("LUPD"), asset_id);
+        let score_history_key = (symbol_short!("SCHIST"), asset_id);
 
         let contract_id = client.address.clone();
 
@@ -2473,6 +2477,7 @@ mod tests {
         env.as_contract(&contract_id, || {
             assert!(env.storage().persistent().has(&score_key));
             assert!(env.storage().persistent().has(&last_update_key));
+            assert!(env.storage().persistent().has(&score_history_key));
         });
 
         // Call decay_score
@@ -2482,6 +2487,7 @@ mod tests {
         env.as_contract(&contract_id, || {
             assert!(env.storage().persistent().has(&score_key));
             assert!(env.storage().persistent().has(&last_update_key));
+            assert!(env.storage().persistent().has(&score_history_key));
         });
     }
 
