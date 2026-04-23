@@ -270,6 +270,35 @@ impl AssetRegistry {
             .unwrap_or_else(|| Vec::new(&env))
     }
 
+    /// Returns a paginated list of asset IDs owned by the given address.
+    ///
+    /// # Arguments
+    /// * `owner` - The address of the asset owner
+    /// * `offset` - Starting index for pagination
+    /// * `limit` - Maximum number of asset IDs to return
+    ///
+    /// # Returns
+    /// Vec containing the requested page of asset IDs
+    pub fn get_assets_by_owner_page(env: Env, owner: Address, offset: u32, limit: u32) -> Vec<u64> {
+        let all_assets: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&owner_index_key(&owner))
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let len = all_assets.len();
+        if offset >= len || limit == 0 {
+            return Vec::new(&env);
+        }
+
+        let end = (offset + limit).min(len);
+        let mut page = Vec::new(&env);
+        for i in offset..end {
+            page.push_back(all_assets.get(i).unwrap());
+        }
+        page
+    }
+
     /// Get the total count of registered assets in the system.
     ///
     /// # Returns
@@ -304,6 +333,45 @@ impl AssetRegistry {
     pub fn get_admin(env: Env) -> Address {
         env.storage().instance().get(&ADMIN_KEY)
             .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized))
+    }
+
+    /// Propose a new admin address (step 1 of 2-step transfer).
+    /// Only the current admin can propose a new admin.
+    ///
+    /// # Arguments
+    /// * `admin` - The current admin address
+    /// * `new_admin` - The address to propose as the new admin
+    ///
+    /// # Panics
+    /// - [`ContractError::UnauthorizedAdmin`] if caller is not the current admin
+    /// - [`ContractError::PendingAdminAlreadyExists`] if a pending admin already exists
+    pub fn propose_admin(env: Env, admin: Address, new_admin: Address) {
+        admin.require_auth();
+        let stored_admin: Address = Self::get_admin(env.clone());
+        if stored_admin != admin {
+            panic_with_error!(&env, ContractError::UnauthorizedAdmin);
+        }
+        if env.storage().instance().has(&PENDING_ADMIN_KEY) {
+            panic_with_error!(&env, ContractError::PendingAdminAlreadyExists);
+        }
+        env.storage().instance().set(&PENDING_ADMIN_KEY, &new_admin);
+    }
+
+    /// Accept the admin transfer (step 2 of 2-step transfer).
+    /// Only the pending admin can accept and become the new admin.
+    ///
+    /// # Panics
+    /// - [`ContractError::NotInitialized`] if no pending admin exists
+    /// - [`ContractError::UnauthorizedAdmin`] if caller is not the pending admin
+    pub fn accept_admin(env: Env) {
+        let pending_admin: Address = env
+            .storage()
+            .instance()
+            .get(&PENDING_ADMIN_KEY)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
+        pending_admin.require_auth();
+        env.storage().instance().set(&ADMIN_KEY, &pending_admin);
+        env.storage().instance().remove(&PENDING_ADMIN_KEY);
     }
 
     /// Admin-only function to pause the contract.
