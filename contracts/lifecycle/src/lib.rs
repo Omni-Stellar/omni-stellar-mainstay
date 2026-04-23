@@ -19,6 +19,7 @@ pub enum ContractError {
     Paused = 9,
     InvalidTaskType = 10,
     PendingAdminAlreadyExists = 11,
+    IndexOutOfBounds = 12,
 }
 
 #[contracttype]
@@ -873,10 +874,13 @@ impl Lifecycle {
     /// # Arguments
     /// * `asset_id` - The unique identifier of the asset
     /// * `offset` - Zero-based start index for pagination
-    /// * `limit` - Maximum number of records to return
+    /// * `limit` - Maximum number of records to return (returns empty vec if 0)
     ///
     /// # Returns
     /// Vec containing the requested page of maintenance records
+    ///
+    /// # Panics
+    /// - [`ContractError::IndexOutOfBounds`] if `offset` >= history length
     pub fn get_maintenance_history_page(
         env: Env,
         asset_id: u64,
@@ -890,8 +894,11 @@ impl Lifecycle {
             .unwrap_or(Vec::new(&env));
 
         let len = history.len();
-        if offset >= len || limit == 0 {
+        if limit == 0 {
             return Vec::new(&env);
+        }
+        if offset >= len {
+            panic_with_error!(&env, ContractError::IndexOutOfBounds);
         }
 
         let end = (offset + limit).min(len);
@@ -1076,13 +1083,15 @@ impl Lifecycle {
     /// Get a paginated list of asset IDs that an engineer has worked on.
     ///
     /// # Arguments
-    /// * `env` - The contract environment
     /// * `engineer` - The address of the engineer to query
-    /// * `offset` - Number of records to skip
-    /// * `limit` - Maximum number of records to return
+    /// * `offset` - Zero-based start index for pagination
+    /// * `limit` - Maximum number of records to return (returns empty vec if 0)
     ///
     /// # Returns
     /// Vec containing the requested page of asset IDs
+    ///
+    /// # Panics
+    /// - [`ContractError::IndexOutOfBounds`] if `offset` >= history length
     pub fn get_eng_history_page(env: Env, engineer: Address, offset: u32, limit: u32) -> Vec<u64> {
         let history: Vec<u64> = env
             .storage()
@@ -1091,8 +1100,11 @@ impl Lifecycle {
             .unwrap_or_else(|| Vec::new(&env));
 
         let len = history.len();
-        if offset >= len || limit == 0 {
+        if limit == 0 {
             return Vec::new(&env);
+        }
+        if offset >= len {
+            panic_with_error!(&env, ContractError::IndexOutOfBounds);
         }
 
         let end = (offset + limit).min(len);
@@ -2271,7 +2283,7 @@ mod tests {
         // Advance ledger so last_update_key unwrap_or(0) would produce a large time_elapsed
         env.ledger().with_mut(|li| li.timestamp += 10_000_000);
 
-        // Score is 0 (never maintained) — early return must fire and return 0
+        // Score is 0 (never maintained) ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â early return must fire and return 0
         assert_eq!(client.decay_score(&asset_id), 0);
     }
 
@@ -2282,7 +2294,7 @@ mod tests {
 
         let (client, _, _, _) = setup(&env, 0);
 
-        // Asset ID 9999 was never registered; score_key is absent → unwrap_or(0) → early return
+        // Asset ID 9999 was never registered; score_key is absent ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ unwrap_or(0) ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ early return
         assert_eq!(client.decay_score(&9999u64), 0);
     }
 
@@ -2452,7 +2464,7 @@ mod tests {
         let asset_id = register_asset(&env, &asset_registry_client);
         let engineer = register_engineer(&env, &engineer_registry_client);
 
-        // Build score to exactly the eligibility threshold (50) via 10 × FILTER (5 pts each)
+        // Build score to exactly the eligibility threshold (50) via 10 ÃƒÆ’Ã¢â‚¬â€ FILTER (5 pts each)
         for _ in 0..10 {
             client.submit_maintenance(
                 &asset_id,
@@ -2463,7 +2475,7 @@ mod tests {
         }
         assert!(client.is_collateral_eligible(&asset_id));
 
-        // Fast decay: 5 points per 60 seconds; advance 2 intervals → -10 pts → score 40 < 50
+        // Fast decay: 5 points per 60 seconds; advance 2 intervals ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ -10 pts ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ score 40 < 50
         client.update_decay_config(&admin, &5, &60);
         env.ledger()
             .with_mut(|li| li.timestamp = li.timestamp + 120);
@@ -2529,7 +2541,7 @@ mod tests {
         let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
         let engineer = register_engineer(&env, &engineer_registry_client);
 
-        // asset_a: 10 × ENGINE (5 pts each) = 50 → eligible
+        // asset_a: 10 ÃƒÆ’Ã¢â‚¬â€ ENGINE (5 pts each) = 50 ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ eligible
         let asset_a = register_asset(&env, &asset_registry_client);
         for _ in 0..10 {
             client.submit_maintenance(
@@ -2540,7 +2552,7 @@ mod tests {
             );
         }
 
-        // asset_b: 1 × OIL_CHG (5 pts) → not eligible
+        // asset_b: 1 ÃƒÆ’Ã¢â‚¬â€ OIL_CHG (5 pts) ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ not eligible
         let asset_b = register_asset(&env, &asset_registry_client);
         client.submit_maintenance(
             &asset_b,
@@ -2876,7 +2888,7 @@ mod tests {
         let asset_id = register_asset(&env, &asset_registry_client);
         let engineer = register_engineer(&env, &engineer_registry_client);
 
-        // Submit 8 records — history_key is capped at 5, score_history must also stay at 5
+        // Submit 8 records ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â history_key is capped at 5, score_history must also stay at 5
         for _ in 0..5 {
             client.submit_maintenance(
                 &asset_id,
@@ -2943,7 +2955,7 @@ mod tests {
             &engineer,
         );
 
-        // n=10 but only 1 entry exists — should return all 1
+        // n=10 but only 1 entry exists ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â should return all 1
         let trend = client.get_score_trend(&asset_id, &10);
         assert_eq!(trend.len(), 1);
     }
@@ -3106,7 +3118,7 @@ mod tests {
             ))),
         );
 
-        // No records written — history still at 2
+        // No records written ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â history still at 2
         assert_eq!(client.get_maintenance_history(&asset_id).len(), 2);
     }
 
@@ -3318,7 +3330,7 @@ mod tests {
         engineer_registry_client.revoke_credential(&engineer);
         assert!(!engineer_registry_client.verify_engineer(&engineer));
 
-        // Attempt to submit maintenance — must fail with UnauthorizedEngineer
+        // Attempt to submit maintenance ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â must fail with UnauthorizedEngineer
         let result = client.try_submit_maintenance(
             &asset_id,
             &symbol_short!("OIL_CHG"),
@@ -3418,7 +3430,7 @@ mod tests {
 
         assert!(engineer_registry_client.verify_engineer(&engineer));
 
-        // Advance ledger by 101 seconds — credential is now expired
+        // Advance ledger by 101 seconds ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â credential is now expired
         env.ledger().with_mut(|li| li.timestamp += 101);
 
         assert!(!engineer_registry_client.verify_engineer(&engineer));
@@ -3463,7 +3475,7 @@ mod tests {
 
         assert!(engineer_registry_client.verify_engineer(&engineer));
 
-        // Advance ledger by 101 seconds — credential is now expired
+        // Advance ledger by 101 seconds ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â credential is now expired
         env.ledger().with_mut(|li| li.timestamp += 101);
 
         assert!(!engineer_registry_client.verify_engineer(&engineer));
@@ -4113,29 +4125,29 @@ mod tests {
             );
         }
 
-        // First page: offset=0, limit=2 → 2 records
+        // First page: offset=0, limit=2 ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ 2 records
         assert_eq!(
             client.get_maintenance_history_page(&asset_id, &0, &2).len(),
             2
         );
-        // Second page: offset=2, limit=2 → 2 records
+        // Second page: offset=2, limit=2 ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ 2 records
         assert_eq!(
             client.get_maintenance_history_page(&asset_id, &2, &2).len(),
             2
         );
-        // Third page: offset=4, limit=2 → 1 record (only one left)
+        // Third page: offset=4, limit=2 ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ 1 record (only one left)
         assert_eq!(
             client.get_maintenance_history_page(&asset_id, &4, &2).len(),
             1
         );
-        // Out-of-bounds offset → empty
+        // Out-of-bounds offset -> IndexOutOfBounds error
         assert_eq!(
-            client
-                .get_maintenance_history_page(&asset_id, &10, &2)
-                .len(),
-            0
+            client.try_get_maintenance_history_page(&asset_id, &10, &2),
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::IndexOutOfBounds as u32,
+            )))
         );
-        // limit=0 → empty
+        // limit=0 ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ empty
         assert_eq!(
             client.get_maintenance_history_page(&asset_id, &0, &0).len(),
             0
@@ -4161,15 +4173,19 @@ mod tests {
             );
         }
 
-        // First page: offset=0, limit=2 → 2 assets
+        // First page: offset=0, limit=2 ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ 2 assets
         assert_eq!(client.get_eng_history_page(&engineer, &0, &2).len(), 2);
-        // Second page: offset=2, limit=2 → 2 assets
+        // Second page: offset=2, limit=2 ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ 2 assets
         assert_eq!(client.get_eng_history_page(&engineer, &2, &2).len(), 2);
-        // Third page: offset=4, limit=2 → 1 asset (only one left)
+        // Third page: offset=4, limit=2 ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ 1 asset (only one left)
         assert_eq!(client.get_eng_history_page(&engineer, &4, &2).len(), 1);
-        // Out-of-bounds offset → empty
-        assert_eq!(client.get_eng_history_page(&engineer, &10, &2).len(), 0);
-        // limit=0 → empty
+        // Out-of-bounds offset -> IndexOutOfBounds error
+        assert_eq!(
+            client.try_get_eng_history_page(&engineer, &10, &2),
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::IndexOutOfBounds as u32,
+            )))
+        );
         assert_eq!(client.get_eng_history_page(&engineer, &0, &0).len(), 0);
     }
 
@@ -4440,7 +4456,7 @@ mod tests {
         let asset_id = register_asset(&env, &asset_registry_client);
         let engineer = register_engineer(&env, &engineer_registry_client);
 
-        // 9 × FILTER (5 pts each) = 45 — below threshold of 50
+        // 9 ÃƒÆ’Ã¢â‚¬â€ FILTER (5 pts each) = 45 ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â below threshold of 50
         for _ in 0..9 {
             client.submit_maintenance(
                 &asset_id,
@@ -4452,7 +4468,7 @@ mod tests {
         assert_eq!(client.get_collateral_score(&asset_id), 45);
         assert!(!client.is_collateral_eligible(&asset_id));
 
-        // 1 more FILTER → 50 — at threshold, now eligible
+        // 1 more FILTER ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ 50 ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â at threshold, now eligible
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("FILTER"),
@@ -4496,7 +4512,7 @@ mod tests {
         );
         assert!(engineer_registry.verify_engineer(&engineer));
 
-        // 4. Submit maintenance — 10 × OVERHAUL (5 pts each) = 50, eligible
+        // 4. Submit maintenance ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â 10 ÃƒÆ’Ã¢â‚¬â€ OVERHAUL (5 pts each) = 50, eligible
         for _ in 0..10 {
             lifecycle.submit_maintenance(
                 &asset_id,
@@ -4537,5 +4553,41 @@ mod tests {
         client.update_score_increment(&admin, &10);
         let config = client.get_config();
         assert_eq!(config.score_increment, 10);
+    }
+
+    #[test]
+    fn test_eng_history_page_out_of_bounds_returns_error() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+
+        // Populate history with exactly 5 entries
+        for _ in 0..5 {
+            let asset_id = register_asset(&env, &asset_registry_client);
+            client.submit_maintenance(
+                &asset_id,
+                &symbol_short!("OIL_CHG"),
+                &String::from_str(&env, "oil change"),
+                &engineer,
+            );
+        }
+
+        // offset=5 equals len -> IndexOutOfBounds
+        assert_eq!(
+            client.try_get_eng_history_page(&engineer, &5, &2),
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::IndexOutOfBounds as u32,
+            )))
+        );
+
+        // offset=10 exceeds len -> IndexOutOfBounds
+        assert_eq!(
+            client.try_get_eng_history_page(&engineer, &10, &2),
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::IndexOutOfBounds as u32,
+            )))
+        );
     }
 }
