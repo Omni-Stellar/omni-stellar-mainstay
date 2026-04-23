@@ -500,6 +500,13 @@ impl AssetRegistry {
     /// is a no-op. This allows the same owner to re-register the same metadata
     /// after the dedup key has naturally expired.
     ///
+    /// # Lifecycle Data
+    /// Maintenance history, collateral score, score history, and last-update timestamp
+    /// stored in the lifecycle contract are **not** removed by this call. They remain
+    /// readable by anyone who knows the asset ID and continue to consume storage until
+    /// they expire or are explicitly removed. After deregistering, call
+    /// `lifecycle::purge_asset_data(admin, asset_id)` to reclaim that storage.
+    ///
     /// # Panics
     /// - [`ContractError::AssetNotFound`] if no asset exists with the given ID
     /// - [`ContractError::UnauthorizedOwner`] if caller is neither the admin nor the asset owner

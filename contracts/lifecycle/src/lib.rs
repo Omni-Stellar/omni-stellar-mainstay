@@ -1422,6 +1422,48 @@ impl Lifecycle {
         env.events()
             .publish((symbol_short!("PRUNE"), admin), asset_id);
     }
+
+    /// Remove all lifecycle data for a deregistered asset.
+    ///
+    /// After `deregister_asset` is called on the asset registry the asset record is gone,
+    /// but maintenance history, collateral score, score history, and the last-update
+    /// timestamp remain in lifecycle storage. Call this function to reclaim that storage
+    /// and prevent stale data from being read by anyone who knows the asset ID.
+    ///
+    /// This is a no-op for keys that do not exist (safe to call on already-clean assets).
+    ///
+    /// # Arguments
+    /// * `admin` - The lifecycle admin address
+    /// * `asset_id` - The unique identifier of the deregistered asset
+    ///
+    /// # Panics
+    /// - [`ContractError::NotInitialized`] if contract has not been initialized
+    /// - [`ContractError::UnauthorizedAdmin`] if caller is not the admin
+    pub fn purge_asset_data(env: Env, admin: Address, asset_id: u64) {
+        ensure_not_paused(&env);
+        admin.require_auth();
+
+        let config: Config = env
+            .storage()
+            .persistent()
+            .get(&CONFIG)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
+        if config.admin != admin {
+            panic_with_error!(&env, ContractError::UnauthorizedAdmin);
+        }
+
+        env.storage().persistent().remove(&history_key(asset_id));
+        env.storage().persistent().remove(&score_key(asset_id));
+        env.storage()
+            .persistent()
+            .remove(&score_history_key(asset_id));
+        env.storage()
+            .persistent()
+            .remove(&last_update_key(asset_id));
+
+        env.events()
+            .publish((symbol_short!("PURGE"), admin), asset_id);
+    }
 }
 
 #[cfg(test)]
@@ -4671,5 +4713,60 @@ mod tests {
         // Score and eligibility are preserved for the new owner
         assert!(lifecycle.get_collateral_score(&asset_id) > 0);
         assert_eq!(asset_registry.get_asset(&asset_id).owner, new_owner);
+    }
+
+    #[test]
+    fn test_purge_asset_data_after_deregister() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (lifecycle, asset_registry, engineer_registry, admin) = setup(&env, 0);
+
+        let owner = Address::generate(&env);
+        let issuer = Address::generate(&env);
+        let engineer = Address::generate(&env);
+
+        engineer_registry.add_trusted_issuer(&issuer);
+        let asset_id = asset_registry.register_asset(
+            &owner,
+            &String::from_str(&env, "Generator"),
+            &String::from_str(&env, "GEN-PURGE-001"),
+        );
+        engineer_registry.register_engineer(
+            &engineer,
+            &BytesN::from_array(&env, &[9u8; 32]),
+            &issuer,
+            &31_536_000,
+        );
+
+        lifecycle.submit_maintenance(
+            &asset_id,
+            &symbol_short!("INSPECT"),
+            &String::from_str(&env, "Pre-deregister check"),
+            &engineer,
+        );
+
+        // Lifecycle data exists before deregister (score history is readable without asset check)
+        assert_eq!(lifecycle.get_score_history(&asset_id).len(), 1);
+
+        // Deregister removes asset from registry but lifecycle data persists
+        asset_registry.deregister_asset(&owner, &asset_id);
+        assert!(
+            asset_registry.try_get_asset(&asset_id).is_err(),
+            "asset should be gone from registry"
+        );
+        assert_eq!(
+            lifecycle.get_score_history(&asset_id).len(),
+            1,
+            "score history persists after deregister"
+        );
+
+        // purge_asset_data clears all lifecycle storage for the asset
+        lifecycle.purge_asset_data(&admin, &asset_id);
+        assert_eq!(
+            lifecycle.get_score_history(&asset_id).len(),
+            0,
+            "score history cleared after purge"
+        );
     }
 }
