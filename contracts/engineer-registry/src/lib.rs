@@ -63,6 +63,7 @@ impl EngineerRegistry {
             credential_hash != BytesN::from_array(&env, &[0u8; 32]),
             "credential hash cannot be zero"
         );
+        assert!(validity_period > 0, "validity_period must be greater than zero");
         let now = env.ledger().timestamp();
         let record = Engineer {
             address: engineer.clone(),
@@ -640,5 +641,22 @@ mod tests {
             env.storage().persistent().get_ttl(&engineer_key(&engineer))
         });
         assert!(ttl > 0, "TTL must be extended after revocation");
+    }
+
+    // --- Issue #369: register_engineer rejects validity_period = 0 ---
+
+    #[test]
+    #[should_panic(expected = "validity_period must be greater than zero")]
+    fn test_register_engineer_zero_validity_period_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin) = setup(&env);
+
+        let engineer = Address::generate(&env);
+        let issuer = Address::generate(&env);
+        let hash = BytesN::from_array(&env, &[1u8; 32]);
+
+        client.add_trusted_issuer(&admin, &issuer);
+        client.register_engineer(&engineer, &hash, &issuer, &0);
     }
 }
