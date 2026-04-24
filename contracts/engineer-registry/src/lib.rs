@@ -129,6 +129,25 @@ impl EngineerRegistry {
         );
     }
 
+    pub fn renew_credential(env: Env, engineer: Address, new_validity_period: u64) {
+        assert!(new_validity_period > 0, "new_validity_period must be greater than zero");
+        let mut record: Engineer = env
+            .storage()
+            .persistent()
+            .get(&engineer_key(&engineer))
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::EngineerNotFound));
+        record.issuer.require_auth();
+        let now = env.ledger().timestamp();
+        let base = if record.expires_at > now { record.expires_at } else { now };
+        record.expires_at = base + new_validity_period;
+        env.storage()
+            .persistent()
+            .set(&engineer_key(&engineer), &record);
+        env.storage()
+            .persistent()
+            .extend_ttl(&engineer_key(&engineer), 518400, 518400);
+    }
+
     pub fn get_engineer(env: Env, engineer: Address) -> Engineer {
         env.storage()
             .persistent()
@@ -640,5 +659,66 @@ mod tests {
             env.storage().persistent().get_ttl(&engineer_key(&engineer))
         });
         assert!(ttl > 0, "TTL must be extended after revocation");
+    }
+
+    // --- Issue #370: renew_credential rejects new_validity_period = 0 ---
+
+    #[test]
+    #[should_panic(expected = "new_validity_period must be greater than zero")]
+    fn test_renew_credential_zero_validity_period_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin) = setup(&env);
+
+        let engineer = Address::generate(&env);
+        let issuer = Address::generate(&env);
+        let hash = BytesN::from_array(&env, &[1u8; 32]);
+
+        client.add_trusted_issuer(&admin, &issuer);
+        client.register_engineer(&engineer, &hash, &issuer, &1000);
+        client.renew_credential(&engineer, &0);
+    }
+
+    #[test]
+    fn test_renew_credential_extends_expiry() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin) = setup(&env);
+
+        let engineer = Address::generate(&env);
+        let issuer = Address::generate(&env);
+        let hash = BytesN::from_array(&env, &[1u8; 32]);
+
+        client.add_trusted_issuer(&admin, &issuer);
+        client.register_engineer(&engineer, &hash, &issuer, &1000);
+
+        let before = client.get_engineer(&engineer).expires_at;
+        client.renew_credential(&engineer, &500);
+        let after = client.get_engineer(&engineer).expires_at;
+
+        assert_eq!(after, before + 500);
+    }
+
+    #[test]
+    fn test_renew_credential_from_now_when_expired() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin) = setup(&env);
+
+        let engineer = Address::generate(&env);
+        let issuer = Address::generate(&env);
+        let hash = BytesN::from_array(&env, &[1u8; 32]);
+
+        client.add_trusted_issuer(&admin, &issuer);
+        client.register_engineer(&engineer, &hash, &issuer, &100);
+
+        // Advance past expiry
+        env.ledger().with_mut(|li| li.timestamp += 200);
+        let now = env.ledger().timestamp();
+
+        client.renew_credential(&engineer, &500);
+        let after = client.get_engineer(&engineer).expires_at;
+
+        assert_eq!(after, now + 500);
     }
 }
