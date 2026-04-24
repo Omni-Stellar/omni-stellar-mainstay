@@ -189,9 +189,16 @@ impl Lifecycle {
             panic_with_error!(&env, ContractError::UnauthorizedAdmin);
         }
 
+        let old_decay_rate = config.decay_rate;
+        let old_decay_interval = config.decay_interval;
         config.decay_rate = decay_rate;
         config.decay_interval = decay_interval;
         env.storage().instance().set(&CONFIG, &config);
+
+        env.events().publish(
+            (symbol_short!("CFG_UPD"),),
+            (old_decay_rate, decay_rate, old_decay_interval, decay_interval),
+        );
     }
 
     pub fn submit_maintenance(
@@ -1756,5 +1763,32 @@ mod tests {
         assert_eq!(client.get_maintenance_history_page(&asset_id, &10, &2).len(), 0);
         // limit=0 → empty
         assert_eq!(client.get_maintenance_history_page(&asset_id, &0, &0).len(), 0);
+    }
+
+    // --- Issue #367: update_decay_config emits CFG_UPD event ---
+
+    #[test]
+    fn test_update_decay_config_emits_cfg_upd_event() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, _, _, admin) = setup(&env, 0);
+
+        client.update_decay_config(&admin, &10, &120);
+
+        let events = env.events().all();
+        assert_eq!(events.len(), 1);
+
+        let (_, topics, data) = events.get(0).unwrap();
+        let t0: Symbol = topics.get(0).unwrap().try_into_val(&env).unwrap();
+        assert_eq!(t0, symbol_short!("CFG_UPD"));
+
+        // Data: (old_decay_rate, new_decay_rate, old_decay_interval, new_decay_interval)
+        let (old_rate, new_rate, old_interval, new_interval): (u32, u32, u64, u64) =
+            data.try_into_val(&env).unwrap();
+        assert_eq!(old_rate, DEFAULT_DECAY_RATE);
+        assert_eq!(new_rate, 10u32);
+        assert_eq!(old_interval, DEFAULT_DECAY_INTERVAL);
+        assert_eq!(new_interval, 120u64);
     }
 }
