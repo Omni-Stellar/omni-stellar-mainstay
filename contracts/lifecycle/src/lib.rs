@@ -550,6 +550,9 @@ impl Lifecycle {
         if config.admin != admin {
             panic_with_error!(&env, ContractError::UnauthorizedAdmin);
         }
+        if threshold == 0 {
+            panic_with_error!(&env, ContractError::InvalidConfig);
+        }
 
         config.eligibility_threshold = threshold;
         env.storage().persistent().set(&CONFIG, &config);
@@ -2552,6 +2555,22 @@ mod tests {
             result,
             Err(Ok(soroban_sdk::Error::from_contract_error(
                 ContractError::UnauthorizedAdmin as u32,
+            ))),
+        );
+    }
+
+    #[test]
+    fn test_update_eligibility_threshold_zero_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, _, _, admin) = setup(&env, 0);
+
+        let result = client.try_update_eligibility_threshold(&admin, &0);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::InvalidConfig as u32,
             ))),
         );
     }
