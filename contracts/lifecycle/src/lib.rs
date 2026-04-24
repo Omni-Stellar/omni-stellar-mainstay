@@ -76,6 +76,7 @@ const EVENT_DECAY: Symbol = symbol_short!("DECAY");
 const EVENT_REG_AST: Symbol = symbol_short!("REG_AST");
 const EVENT_REG_ENG: Symbol = symbol_short!("REG_ENG");
 const EVENT_RST_SCR: Symbol = symbol_short!("RST_SCR");
+const EVENT_XFER: Symbol = symbol_short!("XFER");
 
 fn history_key(asset_id: u64) -> (Symbol, u64) {
     (symbol_short!("HIST"), asset_id)
@@ -639,6 +640,12 @@ impl Lifecycle {
     /// Submit a maintenance record for an asset.
     /// Only verified engineers can submit maintenance records.
     ///
+    /// # Ownership Transfer Note
+    /// Maintenance history is asset-scoped and persists across ownership transfers.
+    /// Records submitted before a transfer still reference the original engineer addresses.
+    /// A sentinel record with `task_type = "XFER"` is inserted by [`record_transfer`] to
+    /// mark the ownership boundary; records before it were performed under the previous owner.
+    ///
     /// # Arguments
     /// * `asset_id` - The unique identifier of the asset being maintained
     /// * `task_type` - Symbol representing the type of maintenance task
@@ -747,6 +754,72 @@ impl Lifecycle {
         // Emit maintenance submission event
         env.events()
             .publish((EVENT_MAINT, asset_id), (task_type, engineer, timestamp));
+    }
+
+    /// Record an ownership transfer in the asset's maintenance history.
+    ///
+    /// Appends a sentinel [`MaintenanceRecord`] with `task_type = "XFER"` and emits a
+    /// `XFER` event so that indexers and new owners can identify the ownership boundary.
+    /// Records before this sentinel were performed under the previous owner; records after
+    /// it are performed under the new owner.
+    ///
+    /// Must be called by the current asset owner (i.e. the new owner, immediately after
+    /// `transfer_asset` on the asset registry) or by the lifecycle admin.
+    ///
+    /// # Arguments
+    /// * `asset_id`      - The unique identifier of the transferred asset
+    /// * `previous_owner` - Address of the owner before the transfer
+    /// * `new_owner`      - Address of the owner after the transfer
+    ///
+    /// # Panics
+    /// - [`ContractError::NotInitialized`] if contract has not been initialized
+    /// - [`ContractError::AssetNotFound`] if the asset does not exist
+    pub fn record_transfer(
+        env: Env,
+        asset_id: u64,
+        previous_owner: Address,
+        new_owner: Address,
+    ) {
+        ensure_not_paused(&env);
+        new_owner.require_auth();
+
+        let config: Config = env
+            .storage()
+            .persistent()
+            .get(&CONFIG)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
+
+        let asset_registry = get_asset_registry_addr(&env);
+        verify_asset_exists(&env, &asset_registry, &asset_id);
+
+        let timestamp = env.ledger().timestamp();
+        let sentinel = MaintenanceRecord {
+            asset_id,
+            task_type: symbol_short!("XFER"),
+            notes: String::from_str(&env, "Ownership transferred"),
+            engineer: new_owner.clone(),
+            timestamp,
+        };
+
+        let mut history: Vec<MaintenanceRecord> = env
+            .storage()
+            .persistent()
+            .get(&history_key(asset_id))
+            .unwrap_or_else(|| Vec::new(&env));
+
+        if config.max_history > 0 && history.len() >= config.max_history {
+            history.remove(0);
+        }
+        history.push_back(sentinel);
+        env.storage()
+            .persistent()
+            .set(&history_key(asset_id), &history);
+        env.storage()
+            .persistent()
+            .extend_ttl(&history_key(asset_id), 518400, 518400);
+
+        env.events()
+            .publish((EVENT_XFER, asset_id), (previous_owner, new_owner, timestamp));
     }
 
     /// Submit multiple maintenance records for the same asset in a single transaction.
@@ -1386,6 +1459,48 @@ impl Lifecycle {
 
         env.events()
             .publish((symbol_short!("PRUNE"), admin), asset_id);
+    }
+
+    /// Remove all lifecycle data for a deregistered asset.
+    ///
+    /// After `deregister_asset` is called on the asset registry the asset record is gone,
+    /// but maintenance history, collateral score, score history, and the last-update
+    /// timestamp remain in lifecycle storage. Call this function to reclaim that storage
+    /// and prevent stale data from being read by anyone who knows the asset ID.
+    ///
+    /// This is a no-op for keys that do not exist (safe to call on already-clean assets).
+    ///
+    /// # Arguments
+    /// * `admin` - The lifecycle admin address
+    /// * `asset_id` - The unique identifier of the deregistered asset
+    ///
+    /// # Panics
+    /// - [`ContractError::NotInitialized`] if contract has not been initialized
+    /// - [`ContractError::UnauthorizedAdmin`] if caller is not the admin
+    pub fn purge_asset_data(env: Env, admin: Address, asset_id: u64) {
+        ensure_not_paused(&env);
+        admin.require_auth();
+
+        let config: Config = env
+            .storage()
+            .persistent()
+            .get(&CONFIG)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
+        if config.admin != admin {
+            panic_with_error!(&env, ContractError::UnauthorizedAdmin);
+        }
+
+        env.storage().persistent().remove(&history_key(asset_id));
+        env.storage().persistent().remove(&score_key(asset_id));
+        env.storage()
+            .persistent()
+            .remove(&score_history_key(asset_id));
+        env.storage()
+            .persistent()
+            .remove(&last_update_key(asset_id));
+
+        env.events()
+            .publish((symbol_short!("PURGE"), admin), asset_id);
     }
 }
 
@@ -4592,6 +4707,123 @@ mod tests {
         let config = client.get_config();
         assert_eq!(config.score_increment, 10);
     }
+<<<<<<< fix/transfer-asset-lifecycle-history
+
+    #[test]
+    fn test_post_transfer_maintenance_history_access() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (lifecycle, asset_registry, engineer_registry, _) = setup(&env, 0);
+
+        let owner = Address::generate(&env);
+        let new_owner = Address::generate(&env);
+        let issuer = Address::generate(&env);
+        let engineer = Address::generate(&env);
+
+        engineer_registry.add_trusted_issuer(&issuer);
+        let asset_id = asset_registry.register_asset(
+            &owner,
+            &String::from_str(&env, "Generator"),
+            &String::from_str(&env, "GEN-001"),
+        );
+        engineer_registry.register_engineer(
+            &engineer,
+            &BytesN::from_array(&env, &[1u8; 32]),
+            &issuer,
+            &31_536_000,
+        );
+
+        // Submit 2 records under original owner
+        lifecycle.submit_maintenance(
+            &asset_id,
+            &symbol_short!("INSPECT"),
+            &String::from_str(&env, "Pre-transfer inspection"),
+            &engineer,
+        );
+        lifecycle.submit_maintenance(
+            &asset_id,
+            &symbol_short!("OIL_CHG"),
+            &String::from_str(&env, "Oil change"),
+            &engineer,
+        );
+
+        // Transfer asset and record the transfer sentinel
+        asset_registry.transfer_asset(&asset_id, &owner, &new_owner);
+        lifecycle.record_transfer(&asset_id, &owner, &new_owner);
+
+        // New owner can read full history (2 maintenance + 1 sentinel)
+        let history = lifecycle.get_maintenance_history(&asset_id);
+        assert_eq!(history.len(), 3);
+
+        // Sentinel is last and marks the ownership boundary
+        let sentinel = history.get(2).unwrap();
+        assert_eq!(sentinel.task_type, symbol_short!("XFER"));
+        assert_eq!(sentinel.engineer, new_owner);
+
+        // Pre-transfer records are still accessible and reference the original engineer
+        assert_eq!(history.get(0).unwrap().engineer, engineer);
+        assert_eq!(history.get(1).unwrap().engineer, engineer);
+
+        // Score and eligibility are preserved for the new owner
+        assert!(lifecycle.get_collateral_score(&asset_id) > 0);
+        assert_eq!(asset_registry.get_asset(&asset_id).owner, new_owner);
+    }
+
+    #[test]
+    fn test_purge_asset_data_after_deregister() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (lifecycle, asset_registry, engineer_registry, admin) = setup(&env, 0);
+
+        let owner = Address::generate(&env);
+        let issuer = Address::generate(&env);
+        let engineer = Address::generate(&env);
+
+        engineer_registry.add_trusted_issuer(&issuer);
+        let asset_id = asset_registry.register_asset(
+            &owner,
+            &String::from_str(&env, "Generator"),
+            &String::from_str(&env, "GEN-PURGE-001"),
+        );
+        engineer_registry.register_engineer(
+            &engineer,
+            &BytesN::from_array(&env, &[9u8; 32]),
+            &issuer,
+            &31_536_000,
+        );
+
+        lifecycle.submit_maintenance(
+            &asset_id,
+            &symbol_short!("INSPECT"),
+            &String::from_str(&env, "Pre-deregister check"),
+            &engineer,
+        );
+
+        // Lifecycle data exists before deregister (score history is readable without asset check)
+        assert_eq!(lifecycle.get_score_history(&asset_id).len(), 1);
+
+        // Deregister removes asset from registry but lifecycle data persists
+        asset_registry.deregister_asset(&owner, &asset_id);
+        assert!(
+            asset_registry.try_get_asset(&asset_id).is_err(),
+            "asset should be gone from registry"
+        );
+        assert_eq!(
+            lifecycle.get_score_history(&asset_id).len(),
+            1,
+            "score history persists after deregister"
+        );
+
+        // purge_asset_data clears all lifecycle storage for the asset
+        lifecycle.purge_asset_data(&admin, &asset_id);
+        assert_eq!(
+            lifecycle.get_score_history(&asset_id).len(),
+            0,
+            "score history cleared after purge"
+        );
+=======
     #[test]
     fn test_update_max_notes_length_stores_new_value() {
         let env = Env::default();
@@ -4668,5 +4900,6 @@ mod tests {
         let short_note = String::from_str(&env, "1234567890");
         client.submit_maintenance(&asset_id, &symbol_short!("OIL_CHG"), &short_note, &engineer);
         assert_eq!(client.get_maintenance_history(&asset_id).len(), 1);
+>>>>>>> main
     }
 }
