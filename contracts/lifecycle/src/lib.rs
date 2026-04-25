@@ -63,6 +63,7 @@ pub struct Config {
 const ASSET_REGISTRY: Symbol = symbol_short!("REGISTRY");
 const ENG_REGISTRY: Symbol = symbol_short!("ENG_REG");
 const CONFIG: Symbol = symbol_short!("CONFIG");
+const ELIG_THRESHOLD: Symbol = symbol_short!("ELIG_THR");
 const PAUSED_KEY: Symbol = symbol_short!("PAUSED");
 const PENDING_ADMIN_KEY: Symbol = symbol_short!("PADMIN");
 const DEFAULT_MAX_HISTORY: u32 = 200;
@@ -177,13 +178,40 @@ fn is_zero_address(env: &Env, addr: &Address) -> bool {
 }
 
 fn is_paused(env: &Env) -> bool {
-    env.storage().instance().get(&PAUSED_KEY).unwrap_or(false)
+    env.storage().persistent().get(&PAUSED_KEY).unwrap_or(false)
 }
 
 fn ensure_not_paused(env: &Env) {
     if is_paused(env) {
         panic_with_error!(env, ContractError::Paused);
     }
+}
+
+/// Compute the decayed score without writing anything to storage.
+/// Returns the score that *would* result from applying decay at the current ledger time.
+fn compute_decay(env: &Env, asset_id: u64) -> u32 {
+    let current_score: u32 = env
+        .storage()
+        .persistent()
+        .get(&score_key(asset_id))
+        .unwrap_or(0u32);
+    if current_score == 0 {
+        return 0;
+    }
+    let last_update: u64 = env
+        .storage()
+        .persistent()
+        .get(&last_update_key(asset_id))
+        .unwrap_or(0u64);
+    let config: Config = env
+        .storage()
+        .persistent()
+        .get(&CONFIG)
+        .unwrap_or_else(|| panic_with_error!(env, ContractError::NotInitialized));
+    let time_elapsed = env.ledger().timestamp().saturating_sub(last_update);
+    let decay_intervals = time_elapsed / config.decay_interval;
+    let total_decay = (decay_intervals as u32) * config.decay_rate;
+    current_score.saturating_sub(total_decay)
 }
 
 fn apply_decay(
@@ -383,8 +411,11 @@ impl Lifecycle {
         if config.admin != admin {
             panic_with_error!(&env, ContractError::UnauthorizedAdmin);
         }
+        env.storage().persistent().set(&PAUSED_KEY, &true);
+        env.storage().persistent().extend_ttl(&PAUSED_KEY, 518400, 518400);
         env.storage().instance().set(&PAUSED_KEY, &true);
         env.storage().instance().extend_ttl(&PAUSED_KEY, 518400, 518400);
+        env.events().publish((symbol_short!("PAUSED"),), (admin,));
     }
 
     /// Admin-only function to unpause the contract.
@@ -405,8 +436,11 @@ impl Lifecycle {
         if config.admin != admin {
             panic_with_error!(&env, ContractError::UnauthorizedAdmin);
         }
+        env.storage().persistent().set(&PAUSED_KEY, &false);
+        env.storage().persistent().extend_ttl(&PAUSED_KEY, 518400, 518400);
         env.storage().instance().set(&PAUSED_KEY, &false);
         env.storage().instance().extend_ttl(&PAUSED_KEY, 518400, 518400);
+        env.events().publish((symbol_short!("UNPAUSED"),), (admin,));
     }
 
     /// Check if the contract is currently paused.
@@ -501,9 +535,12 @@ impl Lifecycle {
             panic_with_error!(&env, ContractError::UnauthorizedAdmin);
         }
 
+        let old_increment = config.score_increment;
         config.score_increment = score_increment;
         env.storage().persistent().set(&CONFIG, &config);
         env.storage().persistent().extend_ttl(&CONFIG, 518400, 518400);
+        env.events()
+            .publish((symbol_short!("CFG_UPD"),), (old_increment, score_increment));
     }
 
     /// Admin-only function to update the decay rate and interval for collateral score decay.
@@ -535,8 +572,16 @@ impl Lifecycle {
             panic_with_error!(&env, ContractError::UnauthorizedAdmin);
         }
 
+        let old_decay_rate = config.decay_rate;
+        let old_decay_interval = config.decay_interval;
         config.decay_rate = decay_rate;
         config.decay_interval = decay_interval;
+        env.storage().instance().set(&CONFIG, &config);
+
+        env.events().publish(
+            (symbol_short!("CFG_UPD"),),
+            (old_decay_rate, decay_rate, old_decay_interval, decay_interval),
+        );
         env.storage().persistent().set(&CONFIG, &config);
         env.storage().persistent().extend_ttl(&CONFIG, 518400, 518400);
     }
@@ -614,6 +659,13 @@ impl Lifecycle {
             .publish((symbol_short!("UPD_MAX"), admin), new_max);
     }
 
+    /// Admin-only: update the eligibility threshold for collateral scoring.
+    pub fn update_eligibility_threshold(env: Env, admin: Address, new_threshold: u32) {
+        admin.require_auth();
+
+        let config: Config = env
+            .storage()
+            .instance()
 
     /// Admin-only function to update the maximum allowed notes length per maintenance record.
     ///
@@ -641,6 +693,19 @@ impl Lifecycle {
         if config.admin != admin {
             panic_with_error!(&env, ContractError::UnauthorizedAdmin);
         }
+
+        let old_threshold: u32 = env
+            .storage()
+            .instance()
+            .get(&ELIG_THRESHOLD)
+            .unwrap_or(DEFAULT_ELIGIBILITY_THRESHOLD);
+        env.storage().instance().set(&ELIG_THRESHOLD, &new_threshold);
+
+        env.events().publish(
+            (symbol_short!("CFG_UPD"),),
+            (old_threshold, new_threshold),
+        );
+    }
 
         config.max_notes_length = new_max;
         env.storage().persistent().set(&CONFIG, &config);
@@ -1063,27 +1128,29 @@ impl Lifecycle {
 
     /// Get the current collateral score for an asset.
     /// Verifies asset exists before returning the score.
-    /// Applies time-based decay lazily and persists the decayed score.
+    ///
+    /// This function is **read-only**: it computes the time-decayed score without
+    /// writing anything to storage. To persist the decayed score and update the
+    /// last-update timestamp, call [`decay_score`] explicitly.
     ///
     /// # Arguments
     /// * `asset_id` - The unique identifier of the asset
     ///
     /// # Returns
-    /// The current collateral score (0-100)
+    /// The current collateral score (0-100) after applying time-based decay
     ///
     /// # Panics
     /// - [`ContractError::NotInitialized`] if contract has not been initialized
     /// - [`ContractError::AssetNotFound`] if the asset does not exist
     pub fn get_collateral_score(env: Env, asset_id: u64) -> u32 {
-        // Verify asset exists before returning score
         let asset_registry = get_asset_registry_addr(&env);
         verify_asset_exists(&env, &asset_registry, &asset_id);
-        let config: Config = env
-            .storage()
+        // Ensure CONFIG is present (NotInitialized guard)
+        env.storage()
             .persistent()
-            .get(&CONFIG)
+            .get::<_, Config>(&CONFIG)
             .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
-        apply_decay(&env, asset_id, false, false, config.max_history)
+        compute_decay(&env, asset_id)
     }
 
     /// Returns the full score trend: one (timestamp, score) entry per maintenance event.
@@ -1150,23 +1217,24 @@ impl Lifecycle {
     /// - [`ContractError::AssetNotFound`] if the asset does not exist
     pub fn is_collateral_eligible(env: Env, asset_id: u64) -> bool {
         // Verify asset exists before checking eligibility
-        let asset_registry: Address = env
-            .storage()
-            .instance()
-            .get(&ASSET_REGISTRY)
-            .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
+        let asset_registry = get_asset_registry_addr(&env);
         let asset_registry_client = asset_registry::AssetRegistryClient::new(&env, &asset_registry);
         asset_registry_client.get_asset(&asset_id);
 
+        let threshold: u32 = env
+            .storage()
+            .instance()
+            .get(&ELIG_THRESHOLD)
+            .unwrap_or(DEFAULT_ELIGIBILITY_THRESHOLD);
+        Self::get_collateral_score(env, asset_id) >= threshold
         let config: Config = env
             .storage()
             .persistent()
             .get(&CONFIG)
             .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
 
-        // Use unchecked version since we already verified asset exists
-        apply_decay(&env, asset_id, false, false, config.max_history)
-            >= config.eligibility_threshold
+        // Use read-only decay computation since we already verified asset exists
+        compute_decay(&env, asset_id) >= config.eligibility_threshold
     }
 
     /// Returns the timestamp of the most recent maintenance event, or None if no maintenance has been submitted.
@@ -1261,16 +1329,6 @@ impl Lifecycle {
             panic_with_error!(&env, ContractError::SameRegistryAddress);
         }
 
-        let eng_registry: Address = env
-            .storage()
-            .instance()
-            .get(&ENG_REGISTRY)
-            .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
-        if new_registry == eng_registry {
-            panic_with_error!(&env, ContractError::InvalidConfig);
-        }
-
-        env.storage().instance().set(&ASSET_REGISTRY, &new_registry);
         set_asset_registry_addr(&env, &new_registry);
 
         env.events()
@@ -1317,16 +1375,6 @@ impl Lifecycle {
             panic_with_error!(&env, ContractError::SameRegistryAddress);
         }
 
-        let asset_registry: Address = env
-            .storage()
-            .instance()
-            .get(&ASSET_REGISTRY)
-            .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
-        if new_registry == asset_registry {
-            panic_with_error!(&env, ContractError::InvalidConfig);
-        }
-
-        env.storage().instance().set(&ENG_REGISTRY, &new_registry);
         set_engineer_registry_addr(&env, &new_registry);
 
         env.events()
@@ -1568,7 +1616,7 @@ mod tests {
     use soroban_sdk::{
         symbol_short,
         testutils::{storage::Persistent as _, Address as _, Events, Ledger},
-        BytesN, Env, String, TryIntoVal,
+        BytesN, Env, String, Symbol, TryIntoVal,
     };
 
     fn setup<'a>(
@@ -2096,6 +2144,28 @@ mod tests {
     }
 
     #[test]
+    fn test_update_score_increment_emits_event() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, _, _, admin) = setup(&env, 0);
+        let old_increment = client.get_config().score_increment;
+        let new_increment: u32 = 12;
+
+        client.update_score_increment(&admin, &new_increment);
+
+        let events = env.events().all();
+        assert_eq!(events.len(), 1);
+        let (_, topics, data) = events.get(0).unwrap();
+        let t0: Symbol = topics.get(0).unwrap().try_into_val(&env).unwrap();
+        assert_eq!(t0, symbol_short!("CFG_UPD"));
+
+        let (emitted_old, emitted_new): (u32, u32) = data.try_into_val(&env).unwrap();
+        assert_eq!(emitted_old, old_increment);
+        assert_eq!(emitted_new, new_increment);
+    }
+
+    #[test]
     fn test_admin_can_update_max_history() {
         let env = Env::default();
         env.mock_all_auths();
@@ -2447,6 +2517,55 @@ mod tests {
         // Ensure value is written back to storage (subsequent reads are consistent)
         let decayed_again = client.get_collateral_score(&asset_id);
         assert_eq!(decayed_again, 10);
+    }
+
+    #[test]
+    fn test_get_collateral_score_is_read_only() {
+        // get_collateral_score must NOT write the decayed score back to storage.
+        // Calling it multiple times across ledger advances must always return the
+        // score computed from the *original* stored value, not a previously-decayed one.
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, engineer_registry_client, admin) = setup(&env, 0);
+        let asset_id = register_asset(&env, &asset_registry_client);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+
+        // Build score to 20 (4 × default score_increment of 5)
+        for _ in 0..4 {
+            client.submit_maintenance(
+                &asset_id,
+                &symbol_short!("ENGINE"),
+                &String::from_str(&env, "Build score"),
+                &engineer,
+            );
+        }
+        assert_eq!(client.get_collateral_score(&asset_id), 20);
+
+        // Fast decay: 5 points per 60 seconds
+        client.update_decay_config(&admin, &5, &60);
+
+        // Advance 60 s (1 interval → −5 pts → expected 15)
+        env.ledger().with_mut(|li| li.timestamp += 60);
+        assert_eq!(client.get_collateral_score(&asset_id), 15);
+
+        // Advance another 60 s without calling decay_score.
+        // If get_collateral_score had written 15 back to storage, the next call
+        // would compute from 15 and return 10. But because it is read-only it must
+        // still compute from the original stored value of 20 and return 10 (2 intervals).
+        env.ledger().with_mut(|li| li.timestamp += 60);
+        assert_eq!(client.get_collateral_score(&asset_id), 10);
+
+        // Confirm the stored score is still 20 (untouched by get_collateral_score)
+        let contract_id = client.address.clone();
+        env.as_contract(&contract_id, || {
+            let stored: u32 = env
+                .storage()
+                .persistent()
+                .get(&score_key(asset_id))
+                .unwrap_or(0);
+            assert_eq!(stored, 20, "stored score must not be mutated by get_collateral_score");
+        });
     }
 
     #[test]
@@ -4157,7 +4276,6 @@ mod tests {
         // Simulate instance TTL expiration by clearing instance storage keys
         env.as_contract(&lifecycle_id, || {
             env.storage().instance().remove(&CONFIG);
-            env.storage().instance().remove(&PAUSED_KEY);
         });
 
         // After instance TTL expiry, registry addresses should still be readable
@@ -4851,21 +4969,84 @@ mod tests {
     }
 
     #[test]
-    fn test_pause_state_persists_across_ttl_boundary() {
+    fn test_pause_emits_event() {
         let env = Env::default();
         env.mock_all_auths();
 
         let (client, _, _, admin) = setup(&env, 0);
+        client.pause(&admin);
+
+        let events = env.events().all();
+        assert_eq!(events.len(), 1);
+        let (_, topics, data) = events.get(0).unwrap();
+        let t0: Symbol = topics.get(0).unwrap().try_into_val(&env).unwrap();
+        assert_eq!(t0, symbol_short!("PAUSED"));
+        let (emitted_admin,): (Address,) = data.try_into_val(&env).unwrap();
+        assert_eq!(emitted_admin, admin);
+    }
+
+    #[test]
+    fn test_unpause_emits_event() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, _, _, admin) = setup(&env, 0);
+        client.pause(&admin);
+        client.unpause(&admin);
+
+        let events = env.events().all();
+        assert_eq!(events.len(), 1);
+        let (_, topics, data) = events.get(0).unwrap();
+        let t0: Symbol = topics.get(0).unwrap().try_into_val(&env).unwrap();
+        assert_eq!(t0, symbol_short!("UNPAUSED"));
+        let (emitted_admin,): (Address,) = data.try_into_val(&env).unwrap();
+        assert_eq!(emitted_admin, admin);
+    }
+
+    #[test]
+    fn test_pause_state_persists_across_ttl_boundary() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let lifecycle_id = env.register(Lifecycle, ());
+        let asset_registry_id = env.register(AssetRegistry, ());
+        let engineer_registry_id = env.register(EngineerRegistry, ());
+        let admin = Address::generate(&env);
+
+        let client = LifecycleClient::new(&env, &lifecycle_id);
+        client.initialize(&asset_registry_id, &engineer_registry_id, &admin, &0u32);
 
         // Pause the contract
         client.pause(&admin);
         assert!(client.is_paused());
 
-        // Simulate TTL boundary by assuming instance storage TTL expires
-        // In a real scenario, if TTL expired without extension, is_paused would return false
-        // But since we extend TTL on every write, the pause state persists
-        // Here we verify the state is still paused after the operation that extended TTL
-        assert!(client.is_paused());
+        // Simulate instance TTL expiry — PAUSED_KEY must survive because it is in persistent storage
+        env.as_contract(&lifecycle_id, || {
+            // Wipe all instance storage to mimic TTL expiration
+            env.storage().instance().remove(&PENDING_ADMIN_KEY);
+        });
+
+        // Pause state must still be true after instance TTL boundary
+        assert!(
+            client.is_paused(),
+            "pause state must survive instance TTL expiry"
+        );
+
+        // submit_maintenance must still be blocked
+        let (_, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
+        let asset_id = register_asset(&env, &asset_registry_client);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+        assert_eq!(
+            client.try_submit_maintenance(
+                &asset_id,
+                &symbol_short!("OIL_CHG"),
+                &String::from_str(&env, "should be blocked"),
+                &engineer,
+            ),
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::Paused as u32
+            )))
+        );
     }
 
     #[test]
@@ -5126,6 +5307,10 @@ mod tests {
 
     #[test]
     fn test_propose_admin_emits_event() {
+    // --- Issue #367: update_decay_config emits CFG_UPD event ---
+
+    #[test]
+    fn test_update_decay_config_emits_cfg_upd_event() {
         let env = Env::default();
         env.mock_all_auths();
 
@@ -5149,6 +5334,29 @@ mod tests {
 
     #[test]
     fn test_accept_admin_emits_event() {
+
+        client.update_decay_config(&admin, &10, &120);
+
+        let events = env.events().all();
+        assert_eq!(events.len(), 1);
+
+        let (_, topics, data) = events.get(0).unwrap();
+        let t0: Symbol = topics.get(0).unwrap().try_into_val(&env).unwrap();
+        assert_eq!(t0, symbol_short!("CFG_UPD"));
+
+        // Data: (old_decay_rate, new_decay_rate, old_decay_interval, new_decay_interval)
+        let (old_rate, new_rate, old_interval, new_interval): (u32, u32, u64, u64) =
+            data.try_into_val(&env).unwrap();
+        assert_eq!(old_rate, DEFAULT_DECAY_RATE);
+        assert_eq!(new_rate, 10u32);
+        assert_eq!(old_interval, DEFAULT_DECAY_INTERVAL);
+        assert_eq!(new_interval, 120u64);
+    }
+
+    // --- Issue #368: update_eligibility_threshold emits CFG_UPD event ---
+
+    #[test]
+    fn test_update_eligibility_threshold_emits_cfg_upd_event() {
         let env = Env::default();
         env.mock_all_auths();
 
@@ -5167,5 +5375,60 @@ mod tests {
 
         let emitted_admin: Address = data.try_into_val(&env).unwrap();
         assert_eq!(emitted_admin, new_admin);
+
+        client.update_eligibility_threshold(&admin, &75);
+
+        let events = env.events().all();
+        assert_eq!(events.len(), 1);
+
+        let (_, topics, data) = events.get(0).unwrap();
+        let t0: Symbol = topics.get(0).unwrap().try_into_val(&env).unwrap();
+        assert_eq!(t0, symbol_short!("CFG_UPD"));
+
+        let (old_threshold, new_threshold): (u32, u32) = data.try_into_val(&env).unwrap();
+        assert_eq!(old_threshold, DEFAULT_ELIGIBILITY_THRESHOLD);
+        assert_eq!(new_threshold, 75u32);
+    }
+
+    #[test]
+    fn test_update_eligibility_threshold_affects_eligibility() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, engineer_registry_client, admin) = setup(&env, 0);
+        let asset_id = register_asset(&env, &asset_registry_client);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+
+        // Build score to 10 (one ENGINE task)
+        client.submit_maintenance(
+            &asset_id,
+            &symbol_short!("ENGINE"),
+            &String::from_str(&env, ""),
+            &engineer,
+        );
+        assert_eq!(client.get_collateral_score(&asset_id), 10);
+
+        // Default threshold is 50 — not eligible
+        assert!(!client.is_collateral_eligible(&asset_id));
+
+        // Lower threshold to 10 — now eligible
+        client.update_eligibility_threshold(&admin, &10);
+        assert!(client.is_collateral_eligible(&asset_id));
+    }
+
+    #[test]
+    fn test_non_admin_cannot_update_eligibility_threshold() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, _, _, _) = setup(&env, 0);
+        let outsider = Address::generate(&env);
+        let result = client.try_update_eligibility_threshold(&outsider, &75);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::UnauthorizedAdmin as u32,
+            ))),
+        );
     }
 }
