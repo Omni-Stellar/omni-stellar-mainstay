@@ -20,6 +20,7 @@ pub enum ContractError {
     PendingAdminAlreadyExists = 9,
     TypeInUse = 10,
     EmptyMetadata = 11,
+    SameOwner = 12,
 }
 
 #[contracttype]
@@ -654,6 +655,10 @@ impl AssetRegistry {
 
         if asset.owner != current_owner {
             panic_with_error!(&env, ContractError::UnauthorizedOwner);
+        }
+
+        if current_owner == new_owner {
+            panic_with_error!(&env, ContractError::SameOwner);
         }
 
         // Move dedup key to new owner
@@ -1322,6 +1327,35 @@ mod tests {
 
         let asset = client.get_asset(&id);
         assert_eq!(asset.owner, new_owner);
+    }
+
+    #[test]
+    fn test_transfer_asset_same_owner_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize_admin(&admin);
+        client.add_asset_type(&admin, &symbol_short!("GENSET"));
+
+        let owner = Address::generate(&env);
+        let id = client.register_asset(
+            &symbol_short!("GENSET"),
+            &String::from_str(&env, "CAT-3516"),
+            &owner,
+        );
+
+        let result = client.try_transfer_asset(&id, &owner, &owner);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::SameOwner as u32
+            )))
+        );
+        // Asset still belongs to original owner
+        assert_eq!(client.get_asset(&id).owner, owner);
     }
 
     #[test]
