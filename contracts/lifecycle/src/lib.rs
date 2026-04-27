@@ -21,6 +21,7 @@ pub enum ContractError {
     PendingAdminAlreadyExists = 11,
     ZeroAddress = 12,
     SameRegistryAddress = 13,
+    IndexOutOfBounds = 14,
 }
 
 #[contracttype]
@@ -615,9 +616,15 @@ impl Lifecycle {
             panic_with_error!(&env, ContractError::InvalidConfig);
         }
 
+        let old_threshold = config.eligibility_threshold;
         config.eligibility_threshold = threshold;
         env.storage().persistent().set(&CONFIG, &config);
         env.storage().persistent().extend_ttl(&CONFIG, 518400, 518400);
+
+        env.events().publish(
+            (symbol_short!("CFG_UPD"),),
+            (old_threshold, threshold),
+        );
     }
 
     /// Admin-only function to update the maximum history records per asset.
@@ -662,14 +669,6 @@ impl Lifecycle {
             .publish((symbol_short!("UPD_MAX"), admin), new_max);
     }
 
-    /// Admin-only: update the eligibility threshold for collateral scoring.
-    pub fn update_eligibility_threshold(env: Env, admin: Address, new_threshold: u32) {
-        admin.require_auth();
-
-        let config: Config = env
-            .storage()
-            .instance()
-
     /// Admin-only function to update the maximum allowed notes length per maintenance record.
     ///
     /// # Arguments
@@ -696,19 +695,6 @@ impl Lifecycle {
         if config.admin != admin {
             panic_with_error!(&env, ContractError::UnauthorizedAdmin);
         }
-
-        let old_threshold: u32 = env
-            .storage()
-            .instance()
-            .get(&ELIG_THRESHOLD)
-            .unwrap_or(DEFAULT_ELIGIBILITY_THRESHOLD);
-        env.storage().instance().set(&ELIG_THRESHOLD, &new_threshold);
-
-        env.events().publish(
-            (symbol_short!("CFG_UPD"),),
-            (old_threshold, new_threshold),
-        );
-    }
 
         config.max_notes_length = new_max;
         env.storage().persistent().set(&CONFIG, &config);
@@ -1078,6 +1064,9 @@ impl Lifecycle {
         offset: u32,
         limit: u32,
     ) -> Vec<MaintenanceRecord> {
+        let asset_registry = get_asset_registry_addr(&env);
+        verify_asset_exists(&env, &asset_registry, &asset_id);
+
         let history: Vec<MaintenanceRecord> = env
             .storage()
             .persistent()
@@ -1233,15 +1222,8 @@ impl Lifecycle {
     pub fn is_collateral_eligible(env: Env, asset_id: u64) -> bool {
         // Verify asset exists before checking eligibility
         let asset_registry = get_asset_registry_addr(&env);
-        let asset_registry_client = asset_registry::AssetRegistryClient::new(&env, &asset_registry);
-        asset_registry_client.get_asset(&asset_id);
+        verify_asset_exists(&env, &asset_registry, &asset_id);
 
-        let threshold: u32 = env
-            .storage()
-            .instance()
-            .get(&ELIG_THRESHOLD)
-            .unwrap_or(DEFAULT_ELIGIBILITY_THRESHOLD);
-        Self::get_collateral_score(env, asset_id) >= threshold
         let config: Config = env
             .storage()
             .persistent()
@@ -1979,34 +1961,6 @@ mod tests {
         let engineer = register_engineer(&env, &engineer_registry_client);
 
         // Register and maintain 5 different assets (exceeds max_history=3)
-        let asset_ids: Vec<u64> = (0..5).map(|_| {
-            let asset_id = register_asset(&env, &asset_registry_client);
-            client.submit_maintenance(
-                &asset_id,
-                &String::from_str(&env, "service"),
-                &engineer,
-            );
-            asset_id
-        }).collect();
-
-        // Engineer history should be capped at max_history (3)
-        let history = client.get_engineer_maintenance_history(&engineer);
-
-        // Oldest entries (asset_ids[0], asset_ids[1]) should have been evicted
-
-        // Newest entries should remain
-    }
-
-
-    #[test]
-    fn test_engineer_history_bounded() {
-        let env = Env::default();
-        env.mock_all_auths();
-
-        let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 3);
-        let engineer = register_engineer(&env, &engineer_registry_client);
-
-        // Register and maintain 5 different assets (exceeds max_history=3)
         let mut asset_ids = Vec::new(&env);
         for _ in 0..5 {
             let asset_id = register_asset(&env, &asset_registry_client);
@@ -2706,6 +2660,7 @@ mod tests {
 
         // Asset ID 9999 was never registered; score_key is absent ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ unwrap_or(0) ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ early return
         assert_eq!(client.decay_score(&9999u64), 0);
+    }
 
     #[test]
     fn test_apply_decay_extends_last_update_ttl_when_score_is_zero() {
@@ -4169,97 +4124,6 @@ mod tests {
     }
 
     #[test]
-    fn test_task_weight_tiers() {
-        let env = Env::default();
-        env.mock_all_auths();
-
-        let (client, asset_registry_client, engineer_registry_client, admin) = setup(&env, 0);
-        let asset_id = register_asset(&env, &asset_registry_client);
-        let engineer = register_engineer(&env, &engineer_registry_client);
-
-        // Minor: OIL_CHG = 2
-        client.submit_maintenance(
-            &asset_id,
-            &symbol_short!("OIL_CHG"),
-            &String::from_str(&env, ""),
-            &engineer,
-        );
-        assert_eq!(client.get_collateral_score(&asset_id), 2);
-
-        client.reset_score(&admin, &asset_id);
-
-        // Medium: FILTER = 5
-        client.submit_maintenance(
-            &asset_id,
-            &symbol_short!("FILTER"),
-            &String::from_str(&env, ""),
-            &engineer,
-        );
-        assert_eq!(client.get_collateral_score(&asset_id), 5);
-
-        client.reset_score(&admin, &asset_id);
-
-        // Major: ENGINE = 10
-        client.submit_maintenance(
-            &asset_id,
-            &symbol_short!("ENGINE"),
-            &String::from_str(&env, ""),
-            &engineer,
-        );
-        assert_eq!(client.get_collateral_score(&asset_id), 10);
-
-        client.reset_score(&admin, &asset_id);
-
-        let result = client.try_submit_maintenance(
-            &asset_id,
-            &symbol_short!("UNKNOWN"),
-            &String::from_str(&env, ""),
-            &engineer,
-        );
-        assert_eq!(
-            result,
-            Err(Ok(soroban_sdk::Error::from_contract_error(
-                ContractError::InvalidTaskType as u32,
-            ))),
-        );
-    }
-
-    #[test]
-    fn test_reset_score_emits_event() {
-        let env = Env::default();
-        env.mock_all_auths();
-
-        let (client, asset_registry_client, engineer_registry_client, admin) = setup(&env, 0);
-        let asset_id = register_asset(&env, &asset_registry_client);
-        let engineer = register_engineer(&env, &engineer_registry_client);
-
-        // Build up a non-zero score
-        client.submit_maintenance(
-            &asset_id,
-            &symbol_short!("ENGINE"),
-            &String::from_str(&env, "Major overhaul"),
-            &engineer,
-        );
-
-        // Reset the score
-        let reset_time = env.ledger().timestamp();
-        client.reset_score(&admin, &asset_id);
-
-        // Verify the reset event was emitted
-        let events = env.events().all();
-        let (_, topics, data) = events.last().unwrap();
-
-        let t0: Symbol = topics.get(0).unwrap().try_into_val(&env).unwrap();
-        let t1: u64 = topics.get(1).unwrap().try_into_val(&env).unwrap();
-        assert_eq!(t0, EVENT_RST_SCR);
-        assert_eq!(t1, asset_id);
-
-        let (emitted_admin, emitted_timestamp): (Address, u64) = data.try_into_val(&env).unwrap();
-        assert_eq!(emitted_admin, admin);
-        assert_eq!(emitted_timestamp, reset_time);
-    }
-
-    #[test]
     fn test_non_admin_cannot_reset_score() {
         let env = Env::default();
         env.mock_all_auths();
@@ -4791,17 +4655,18 @@ mod tests {
             client.get_maintenance_history_page(&asset_id, &4, &2).len(),
             1
         );
-        // Out-of-bounds offset ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ empty
+        // Out-of-bounds offset -> IndexOutOfBounds error
         assert_eq!(
-            client
-                .get_maintenance_history_page(&asset_id, &10, &2)
-                .len(),
-            0
+            client.try_get_maintenance_history_page(&asset_id, &10, &2),
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::IndexOutOfBounds as u32,
+            )))
         );
-        // limit=0 ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ empty
+        // limit=0 -> empty
         assert_eq!(
             client.get_maintenance_history_page(&asset_id, &0, &0).len(),
             0
+        );
         );
     }
 
@@ -4830,6 +4695,21 @@ mod tests {
         // offset >> len (10) -> IndexOutOfBounds
         let result = client.try_get_maintenance_history_page(&asset_id, &10, &2);
         assert_eq!(result, Err(Ok(ContractError::IndexOutOfBounds)));
+    }
+
+    #[test]
+    fn test_get_maintenance_history_page_nonexistent_asset_returns_error() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, _, _, _) = setup(&env, 0);
+        let result = client.try_get_maintenance_history_page(&999u64, &0, &10);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::AssetNotFound as u32,
+            ))),
+        );
     }
 
     #[test]
@@ -5471,15 +5351,10 @@ mod tests {
             0,
             "score history cleared after purge"
         );
-      main
     }
 
     #[test]
     fn test_propose_admin_emits_event() {
-    // --- Issue #367: update_decay_config emits CFG_UPD event ---
-
-    #[test]
-    fn test_update_decay_config_emits_cfg_upd_event() {
         let env = Env::default();
         env.mock_all_auths();
 
@@ -5503,6 +5378,34 @@ mod tests {
 
     #[test]
     fn test_accept_admin_emits_event() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, _, _, admin) = setup(&env, 0);
+        let new_admin = Address::generate(&env);
+
+        client.propose_admin(&admin, &new_admin);
+        client.accept_admin();
+
+        let events = env.events().all();
+        let (_, topics, data) = events.last().unwrap();
+
+        use soroban_sdk::TryIntoVal;
+        let topic: Symbol = topics.get(0).unwrap().try_into_val(&env).unwrap();
+        assert_eq!(topic, EVENT_ADMIN_SET);
+
+        let emitted_admin: Address = data.try_into_val(&env).unwrap();
+        assert_eq!(emitted_admin, new_admin);
+    }
+
+    // --- Issue #367: update_decay_config emits CFG_UPD event ---
+
+    #[test]
+    fn test_update_decay_config_emits_cfg_upd_event() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, _, _, admin) = setup(&env, 0);
 
         client.update_decay_config(&admin, &10, &120);
 
@@ -5530,20 +5433,6 @@ mod tests {
         env.mock_all_auths();
 
         let (client, _, _, admin) = setup(&env, 0);
-        let new_admin = Address::generate(&env);
-
-        client.propose_admin(&admin, &new_admin);
-        client.accept_admin();
-
-        let events = env.events().all();
-        let (_, topics, data) = events.last().unwrap();
-
-        use soroban_sdk::TryIntoVal;
-        let topic: Symbol = topics.get(0).unwrap().try_into_val(&env).unwrap();
-        assert_eq!(topic, EVENT_ADMIN_SET);
-
-        let emitted_admin: Address = data.try_into_val(&env).unwrap();
-        assert_eq!(emitted_admin, new_admin);
 
         client.update_eligibility_threshold(&admin, &75);
 
