@@ -4,7 +4,6 @@ use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, log, panic_with_error, symbol_short,
     Address, BytesN, Env, String, Symbol, Vec,
 };
-use lifecycle::LifecycleClient;
 
 #[contracterror]
 #[derive(Copy, Clone, Debug, PartialEq)]
@@ -818,8 +817,13 @@ impl AssetRegistry {
         }
 
         // Cross-call the Lifecycle contract to get the collateral score
-        let lifecycle_client = LifecycleClient::new(&env, &lifecycle_contract);
-        lifecycle_client.get_collateral_score(&asset_id)
+        // Using invoke_contract to avoid circular dependency
+        let score: u32 = env.invoke_contract(
+            &lifecycle_contract,
+            &symbol_short!("get_collateral_score"),
+            (&asset_id,),
+        );
+        score
     }
 }
 
