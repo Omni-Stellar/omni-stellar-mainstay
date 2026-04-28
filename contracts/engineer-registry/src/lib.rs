@@ -1407,7 +1407,6 @@ mod tests {
         let issuer = Address::generate(&env);
         let hash = BytesN::from_array(&env, &[1u8; 32]);
         client.add_trusted_issuer(&admin, &issuer);
-        client.register_engineer(&engineer, &hash, &issuer, &0);
         let result = client.try_register_engineer(&engineer, &hash, &issuer, &0);
         assert_eq!(
             result,
