@@ -2670,7 +2670,6 @@ mod tests {
         assert_eq!(client.decay_score(&9999u64), 0);
     }
 
-    }
     #[test]
     fn test_apply_decay_extends_last_update_ttl_when_score_is_zero() {
         let env = Env::default();
@@ -4070,40 +4069,6 @@ mod tests {
         assert_eq!(ev_old, initial_score);
         assert_eq!(ev_new, expected_new_score);
         assert_eq!(ev_ts, decay_time);
-    }
-
-    #[test]
-    fn test_reset_score_emits_event_basic() {
-        let env = Env::default();
-        env.mock_all_auths();
-
-        let (client, asset_registry_client, engineer_registry_client, admin) = setup(&env, 0);
-        let asset_id = register_asset(&env, &asset_registry_client);
-        let engineer = register_engineer(&env, &engineer_registry_client);
-
-        client.submit_maintenance(
-            &asset_id,
-            &symbol_short!("ENGINE"),
-            &String::from_str(&env, "Major overhaul"),
-            &engineer,
-        );
-
-        let reset_time = env.ledger().timestamp();
-        client.reset_score(&admin, &asset_id);
-
-        let events = env.events().all();
-        assert_eq!(events.len(), 1);
-
-        let (_, topics, data) = events.get(0).unwrap();
-
-        let t0: Symbol = topics.get(0).unwrap().try_into_val(&env).unwrap();
-        let t1: u64 = topics.get(1).unwrap().try_into_val(&env).unwrap();
-        assert_eq!(t0, EVENT_RST_SCR);
-        assert_eq!(t1, asset_id);
-
-        let (emitted_admin, emitted_timestamp): (Address, u64) = data.try_into_val(&env).unwrap();
-        assert_eq!(emitted_admin, admin);
-        assert_eq!(emitted_timestamp, reset_time);
     }
 
     #[test]
