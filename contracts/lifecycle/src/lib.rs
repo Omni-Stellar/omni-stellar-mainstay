@@ -1112,6 +1112,9 @@ impl Lifecycle {
         if offset >= len {
             return Vec::new(&env);
         }
+        if offset >= len {
+            panic_with_error!(&env, ContractError::IndexOutOfBounds);
+        }
 
         let end = (offset + limit).min(len);
         let mut page = Vec::new(&env);
@@ -1316,13 +1319,15 @@ impl Lifecycle {
     /// Get a paginated list of asset IDs that an engineer has worked on.
     ///
     /// # Arguments
-    /// * `env` - The contract environment
     /// * `engineer` - The address of the engineer to query
-    /// * `offset` - Number of records to skip
-    /// * `limit` - Maximum number of records to return
+    /// * `offset` - Zero-based start index for pagination
+    /// * `limit` - Maximum number of records to return (returns empty vec if 0)
     ///
     /// # Returns
     /// Vec containing the requested page of asset IDs
+    ///
+    /// # Panics
+    /// - [`ContractError::IndexOutOfBounds`] if `offset` >= history length
     pub fn get_eng_history_page(env: Env, engineer: Address, offset: u32, limit: u32) -> Vec<u64> {
         let history: Vec<u64> = env
             .storage()
@@ -1336,6 +1341,9 @@ impl Lifecycle {
         }
         if offset >= len {
             return Vec::new(&env);
+        }
+        if offset >= len {
+            panic_with_error!(&env, ContractError::IndexOutOfBounds);
         }
 
         let end = (offset + limit).min(len);
