@@ -880,8 +880,10 @@ impl Lifecycle {
             .extend_ttl(&last_update_key(asset_id), TTL_THRESHOLD, TTL_TARGET);
 
         // Emit maintenance submission event
-        env.events()
-            .publish((EVENT_MAINT, asset_id), (task_type, engineer, timestamp));
+        env.events().publish(
+            (symbol_short!("maint"),),
+            (asset_id, engineer.clone(), task_type, timestamp),
+        );
     }
 
     /// Record an ownership transfer in the asset's maintenance history.
@@ -1373,7 +1375,7 @@ impl Lifecycle {
     /// # Returns
     /// A Vec containing the **first 100** asset IDs this engineer has worked on.
     /// If the engineer has more than 100 entries the result is silently truncated —
-    /// call [`get_engineer_maintenance_history_count`] to check the total, then use
+    /// call [`get_eng_maint_hist_count`] to check the total, then use
     /// [`get_eng_history_page`] with `offset`/`limit` to retrieve the full history.
     pub fn get_engineer_maintenance_history(env: Env, engineer: Address) -> Vec<u64> {
         let history: Vec<u64> = env
@@ -1404,7 +1406,7 @@ impl Lifecycle {
     ///
     /// # Returns
     /// Total number of entries in the engineer's maintenance history.
-    pub fn get_engineer_maintenance_history_count(env: Env, engineer: Address) -> u32 {
+    pub fn get_eng_maint_hist_count(env: Env, engineer: Address) -> u32 {
         let history: Vec<u64> = env
             .storage()
             .persistent()
@@ -2950,15 +2952,40 @@ mod tests {
         let asset_id = register_asset(&env, &asset_registry_client);
         let engineer = register_engineer(&env, &engineer_registry_client);
 
+        let task_type = symbol_short!("OIL_CHG");
+        let timestamp = env.ledger().timestamp();
         client.submit_maintenance(
             &asset_id,
-            &symbol_short!("OIL_CHG"),
+            &task_type,
             &String::from_str(&env, "Routine"),
             &engineer,
         );
 
+        use soroban_sdk::{FromVal, TryIntoVal};
+        let maint_topic = symbol_short!("maint");
         let events = env.events().all();
-        assert!(events.len() > 0);
+        let (_, topics, data) = events
+            .iter()
+            .find(|(_, topics, _)| {
+                topics.get(0).map_or(false, |v| {
+                    Symbol::from_val(&env, &v) == maint_topic
+                })
+            })
+            .expect("maint event not emitted");
+
+        let t0: Symbol = topics.get(0).unwrap().try_into_val(&env).unwrap();
+        assert_eq!(t0, maint_topic);
+
+        let (emitted_asset_id, emitted_engineer, emitted_task_type, emitted_timestamp): (
+            u64,
+            Address,
+            Symbol,
+            u64,
+        ) = data.try_into_val(&env).unwrap();
+        assert_eq!(emitted_asset_id, asset_id);
+        assert_eq!(emitted_engineer, engineer);
+        assert_eq!(emitted_task_type, task_type);
+        assert_eq!(emitted_timestamp, timestamp);
     }
 
     #[test]
@@ -2993,7 +3020,7 @@ mod tests {
 
         // Try to initialize again
         let result =
-            lifecycle.try_initialize(&asset_registry_id, &engineer_registry_id, &admin, &0u32);
+            lifecycle.try_initialize(&admin, &asset_registry_id, &engineer_registry_id, &admin, &0u32);
         assert_eq!(
             result,
             Err(Ok(soroban_sdk::Error::from_contract_error(
@@ -3012,7 +3039,8 @@ mod tests {
         let admin = Address::generate(&env);
 
         let lifecycle = LifecycleClient::new(&env, &lifecycle_id);
-        let result = lifecycle.try_initialize(&same_registry_id, &same_registry_id, &admin, &0u32);
+        let result =
+            lifecycle.try_initialize(&admin, &same_registry_id, &same_registry_id, &admin, &0u32);
         assert_eq!(
             result,
             Err(Ok(soroban_sdk::Error::from_contract_error(
@@ -4785,7 +4813,7 @@ mod tests {
         let history = client.get_engineer_maintenance_history(&engineer);
         assert_eq!(history.len(), 100u32);
         // confirm the full count is accessible via the count helper
-        assert_eq!(client.get_engineer_maintenance_history_count(&engineer), 101u32);
+        assert_eq!(client.get_eng_maint_hist_count(&engineer), 101u32);
     }
 
     #[test]
@@ -5883,7 +5911,7 @@ mod tests {
         let engineer = Address::generate(&env);
         let eng_admin = Address::generate(&env);
 
-        engineer_registry.initialize_admin(&eng_admin);
+        engineer_registry.initialize_admin(&eng_admin, &eng_admin);
         engineer_registry.add_trusted_issuer(&eng_admin, &issuer);
         let asset_id = asset_registry.register_asset(
             &symbol_short!("GENSET"),
@@ -5921,11 +5949,10 @@ mod tests {
         let xfer_event = events
             .iter()
             .find(|(_, topics, _)| {
-                topics
-                    .get(0)
-                    .and_then(|v| v.try_into_val::<_, Symbol>(&env).ok())
-                    .map(|s| s == symbol_short!("XFER"))
-                    .unwrap_or(false)
+                use soroban_sdk::FromVal;
+                topics.get(0).map_or(false, |v| {
+                    Symbol::from_val(&env, &v) == symbol_short!("XFER")
+                })
             })
             .expect("XFER event not emitted");
 
