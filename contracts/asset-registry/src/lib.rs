@@ -77,15 +77,17 @@ fn type_count_key(asset_type: &Symbol) -> (Symbol, Symbol) {
 
 fn type_count_inc(env: &Env, asset_type: &Symbol) {
     let key = type_count_key(asset_type);
-    let count: u64 = env.storage().instance().get(&key).unwrap_or(0);
-    env.storage().instance().set(&key, &(count + 1));
+    let count: u64 = env.storage().persistent().get(&key).unwrap_or(0);
+    env.storage().persistent().set(&key, &(count + 1));
+    env.storage().persistent().extend_ttl(&key, 518400, 518400);
 }
 
 fn type_count_dec(env: &Env, asset_type: &Symbol) {
     let key = type_count_key(asset_type);
-    let count: u64 = env.storage().instance().get(&key).unwrap_or(0);
+    let count: u64 = env.storage().persistent().get(&key).unwrap_or(0);
     if count > 0 {
-        env.storage().instance().set(&key, &(count - 1));
+        env.storage().persistent().set(&key, &(count - 1));
+        env.storage().persistent().extend_ttl(&key, 518400, 518400);
     }
 }
 
@@ -771,7 +773,7 @@ impl AssetRegistry {
         }
         let count: u64 = env
             .storage()
-            .instance()
+            .persistent()
             .get(&type_count_key(&asset_type))
             .unwrap_or(0);
         if count > 0 {
@@ -2840,5 +2842,60 @@ mod tests {
 
         // get_admin must still resolve correctly (TTL was extended at init time)
         assert_eq!(client.get_admin(), admin);
+    }
+
+    /// Regression test: type_count must survive instance TTL expiry.
+    ///
+    /// Before the fix, type_count was stored in instance storage. If instance
+    /// storage expired, remove_asset_type would read 0 and incorrectly allow
+    /// removal of a type that still has registered assets.
+    ///
+    /// After the fix, type_count is in persistent storage. Advancing the ledger
+    /// sequence past the instance TTL window must not affect the count, and
+    /// remove_asset_type must still be blocked.
+    #[test]
+    fn test_remove_asset_type_blocked_after_instance_ttl_boundary() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize_admin(&admin, &admin);
+        client.add_asset_type(&admin, &symbol_short!("GENSET"));
+
+        let owner = Address::generate(&env);
+        client.register_asset(
+            &symbol_short!("GENSET"),
+            &String::from_str(&env, "CAT-3516"),
+            &owner,
+        );
+
+        // Verify the count is in persistent storage (not instance).
+        let persistent_count: u64 = env.as_contract(&contract_id, || {
+            env.storage()
+                .persistent()
+                .get(&type_count_key(&symbol_short!("GENSET")))
+                .unwrap_or(0)
+        });
+        assert_eq!(persistent_count, 1, "type count must be in persistent storage");
+
+        // Advance ledger sequence well past the instance TTL window.
+        // In the old code this would cause instance storage to return 0,
+        // allowing remove_asset_type to succeed incorrectly.
+        env.ledger().with_mut(|li| {
+            li.sequence_number += 518400 + 1;
+            li.timestamp += (518400 + 1) * 5;
+        });
+
+        // remove_asset_type must still be blocked because the asset still exists.
+        let result = client.try_remove_asset_type(&admin, &symbol_short!("GENSET"));
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::TypeInUse as u32
+            ))),
+            "remove_asset_type must be blocked when assets of that type exist"
+        );
     }
 }
