@@ -816,7 +816,7 @@ mod tests {
         client.initialize_admin(&admin, &admin);
 
         // Second call should fail with structured error
-        let result = client.try_initialize_admin(&admin);
+        let result = client.try_initialize_admin(&admin, &admin);
         assert_eq!(
             result,
             Err(Ok(soroban_sdk::Error::from_contract_error(
@@ -2405,6 +2405,8 @@ mod tests {
 
         let result = client.try_initialize_admin(&deployer, &attacker);
         assert!(result.is_err(), "non-deployer must not be able to initialize");
+    }
+
     fn setup_engineer(
         env: &Env,
         client: &EngineerRegistryClient,
@@ -2429,7 +2431,7 @@ mod tests {
         let client = EngineerRegistryClient::new(&env, &contract_id);
         let admin = Address::generate(&env);
         let issuer = Address::generate(&env);
-        client.initialize_admin(&admin);
+        client.initialize_admin(&admin, &admin);
         client.add_trusted_issuer(&admin, &issuer);
 
         let e1 = setup_engineer(&env, &client, &issuer, 1);
@@ -2451,7 +2453,7 @@ mod tests {
         let client = EngineerRegistryClient::new(&env, &contract_id);
         let admin = Address::generate(&env);
         let issuer = Address::generate(&env);
-        client.initialize_admin(&admin);
+        client.initialize_admin(&admin, &admin);
         client.add_trusted_issuer(&admin, &issuer);
 
         let active = setup_engineer(&env, &client, &issuer, 10);
@@ -2476,7 +2478,7 @@ mod tests {
         let client = EngineerRegistryClient::new(&env, &contract_id);
         let admin = Address::generate(&env);
         let issuer = Address::generate(&env);
-        client.initialize_admin(&admin);
+        client.initialize_admin(&admin, &admin);
         client.add_trusted_issuer(&admin, &issuer);
 
         let e1 = setup_engineer(&env, &client, &issuer, 20);
