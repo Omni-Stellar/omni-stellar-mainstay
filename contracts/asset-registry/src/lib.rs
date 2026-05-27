@@ -166,6 +166,12 @@ fn owner_index_remove(env: &Env, owner: &Address, asset_id: u64) {
             updated.push_back(id);
         }
     }
+    if updated.is_empty() {
+        env.storage().persistent().remove(&key);
+    } else {
+        env.storage().persistent().set(&key, &updated);
+        env.storage().persistent().extend_ttl(&key, 518400, 518400);
+    }
     env.storage().persistent().set(&key, &updated);
     env.storage().persistent().extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
 }
@@ -1818,6 +1824,32 @@ mod tests {
             idx_miss_event.is_some(),
             "IDX_MISS diagnostic event must be emitted when owner index is missing"
         );
+    }
+
+    #[test]
+    fn test_owner_index_key_removed_after_last_asset_deregistered() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize_admin(&admin);
+        client.add_asset_type(&admin, &symbol_short!("GENSET"));
+
+        let owner = Address::generate(&env);
+        let id = client.register_asset(
+            &symbol_short!("GENSET"),
+            &String::from_str(&env, "CAT-3516"),
+            &owner,
+        );
+
+        client.deregister_asset(&admin, &id);
+
+        let key_exists = env.as_contract(&contract_id, || {
+            env.storage().persistent().has(&owner_index_key(&owner))
+        });
+        assert!(!key_exists, "owner index key must be absent after last asset is removed");
     }
 
     #[test]
