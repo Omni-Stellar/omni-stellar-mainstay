@@ -198,6 +198,7 @@ impl AssetRegistry {
             .persistent()
             .extend_ttl(&ASSET_COUNT, 518400, 518400);
         env.storage().persistent().set(&dk, &id);
+        env.storage().persistent().extend_ttl(&dk, 518400, 518400);
 
         // Update owner index
         owner_index_add(&env, &owner, id);
@@ -1005,6 +1006,29 @@ mod tests {
             env.storage().persistent().get_ttl(&dk)
         });
         assert!(dedup_ttl > 0, "Deduplication key TTL should be extended");
+    }
+
+    #[test]
+    fn test_register_asset_dedup_key_ttl_is_set() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize_admin(&admin);
+        client.add_asset_type(&admin, &symbol_short!("GENSET"));
+
+        let owner = Address::generate(&env);
+        let metadata = String::from_str(&env, "Dedup TTL test asset");
+        client.register_asset(&symbol_short!("GENSET"), &metadata, &owner);
+
+        let meta_bytes = metadata.to_xdr(&env);
+        let meta_hash: BytesN<32> = env.crypto().sha256(&meta_bytes).into();
+        let ttl = env.as_contract(&contract_id, || {
+            env.storage().persistent().get_ttl(&dedup_key(&owner, &meta_hash))
+        });
+        assert!(ttl > 0, "dedup key TTL must be extended after register_asset");
     }
 
     #[test]
