@@ -47,6 +47,11 @@ const PAUSED_KEY: Symbol = symbol_short!("PAUSED");
 const ADMIN_KEY: Symbol = symbol_short!("ADMIN");
 const ASSET_TYPE_PREFIX: Symbol = symbol_short!("AST_TYPE");
 const PENDING_ADMIN_KEY: Symbol = symbol_short!("PADMIN");
+
+/// Soroban persistent-storage TTL constants.
+/// 1 ledger ≈ 5 seconds → 518_400 ledgers ≈ 30 days.
+const TTL_THRESHOLD: u32 = 518_400;
+const TTL_TARGET: u32 = 518_400;
 pub const DEREG_TOPIC: Symbol = symbol_short!("DEREG");
 pub const ADD_TYPE_TOPIC: Symbol = symbol_short!("ADD_TYPE");
 pub const RM_TYPE_TOPIC: Symbol = symbol_short!("RM_TYPE");
@@ -99,7 +104,7 @@ fn owner_index_add(env: &Env, owner: &Address, asset_id: u64) {
         .unwrap_or_else(|| Vec::new(env));
     ids.push_back(asset_id);
     env.storage().persistent().set(&key, &ids);
-    env.storage().persistent().extend_ttl(&key, 518400, 518400);
+    env.storage().persistent().extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
 }
 
 /// Remove an asset ID from the owner's index.
@@ -128,7 +133,7 @@ fn owner_index_remove(env: &Env, owner: &Address, asset_id: u64) {
         }
     }
     env.storage().persistent().set(&key, &updated);
-    env.storage().persistent().extend_ttl(&key, 518400, 518400);
+    env.storage().persistent().extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
 }
 
 fn is_paused(env: &Env) -> bool {
@@ -192,11 +197,11 @@ impl AssetRegistry {
         env.storage().persistent().set(&asset_key(id), &asset);
         env.storage()
             .persistent()
-            .extend_ttl(&asset_key(id), 518400, 518400); // Extend TTL for persistent storage entries to prevent data loss
+            .extend_ttl(&asset_key(id), TTL_THRESHOLD, TTL_TARGET); // Extend TTL for persistent storage entries to prevent data loss
         env.storage().persistent().set(&ASSET_COUNT, &id);
         env.storage()
             .persistent()
-            .extend_ttl(&ASSET_COUNT, 518400, 518400);
+            .extend_ttl(&ASSET_COUNT, TTL_THRESHOLD, TTL_TARGET);
         env.storage().persistent().set(&dk, &id);
 
         // Update owner index
@@ -267,13 +272,13 @@ impl AssetRegistry {
             env.storage().persistent().set(&asset_key(id), &asset);
             env.storage()
                 .persistent()
-                .extend_ttl(&asset_key(id), 518400, 518400);
+                .extend_ttl(&asset_key(id), TTL_THRESHOLD, TTL_TARGET);
             env.storage()
                 .persistent()
                 .set(&dedup_key(&owner, &meta_hash), &id);
             env.storage()
                 .persistent()
-                .extend_ttl(&dedup_key(&owner, &meta_hash), 518400, 518400);
+                .extend_ttl(&dedup_key(&owner, &meta_hash), TTL_THRESHOLD, TTL_TARGET);
 
             owner_index_add(&env, &owner, id);
 
@@ -296,14 +301,14 @@ impl AssetRegistry {
             env.storage().persistent().set(&ASSET_COUNT, &next_id);
             env.storage()
                 .persistent()
-                .extend_ttl(&ASSET_COUNT, 518400, 518400);
+                .extend_ttl(&ASSET_COUNT, TTL_THRESHOLD, TTL_TARGET);
         }
 
         // Ensure owner index TTL is extended after all batch writes
         if !ids.is_empty() {
             env.storage()
                 .persistent()
-                .extend_ttl(&owner_index_key(&owner), 518400, 518400);
+                .extend_ttl(&owner_index_key(&owner), TTL_THRESHOLD, TTL_TARGET);
         }
 
         // Emit batch registration event
@@ -348,7 +353,7 @@ impl AssetRegistry {
             .get(&key)
             .unwrap_or_else(|| Vec::new(&env));
         if env.storage().persistent().has(&key) {
-            env.storage().persistent().extend_ttl(&key, 518400, 518400);
+            env.storage().persistent().extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
         }
         ids
     }
@@ -404,7 +409,7 @@ impl AssetRegistry {
             panic_with_error!(&env, ContractError::AdminAlreadyInitialized);
         }
         env.storage().instance().set(&ADMIN_KEY, &admin);
-        env.storage().instance().extend_ttl(518400, 518400);
+        env.storage().instance().extend_ttl(TTL_THRESHOLD, TTL_TARGET);
     }
 
     /// Get the current admin address of the contract.
@@ -483,7 +488,7 @@ impl AssetRegistry {
         env.storage().persistent().set(&PAUSED_KEY, &true);
         env.storage()
             .persistent()
-            .extend_ttl(&PAUSED_KEY, 518400, 518400);
+            .extend_ttl(&PAUSED_KEY, TTL_THRESHOLD, TTL_TARGET);
         env.events().publish((symbol_short!("PAUSED"),), (admin,));
     }
 
@@ -500,7 +505,7 @@ impl AssetRegistry {
         env.storage().persistent().set(&PAUSED_KEY, &false);
         env.storage()
             .persistent()
-            .extend_ttl(&PAUSED_KEY, 518400, 518400);
+            .extend_ttl(&PAUSED_KEY, TTL_THRESHOLD, TTL_TARGET);
         env.events().publish((symbol_short!("UNPAUSED"),), (admin,));
     }
 
@@ -625,13 +630,13 @@ impl AssetRegistry {
         env.storage().persistent().set(&new_dk, &asset_id);
         env.storage()
             .persistent()
-            .extend_ttl(&new_dk, 518400, 518400);
+            .extend_ttl(&new_dk, TTL_THRESHOLD, TTL_TARGET);
         asset.metadata = new_metadata.clone();
         asset.metadata_updated_at = env.ledger().timestamp();
         env.storage().persistent().set(&asset_key(asset_id), &asset);
         env.storage()
             .persistent()
-            .extend_ttl(&asset_key(asset_id), 518400, 518400);
+            .extend_ttl(&asset_key(asset_id), TTL_THRESHOLD, TTL_TARGET);
 
         env.events().publish(
             (symbol_short!("UPD_META"), asset_id),
@@ -681,7 +686,7 @@ impl AssetRegistry {
             .set(&dedup_key(&new_owner, &hash), &asset_id);
         env.storage()
             .persistent()
-            .extend_ttl(&dedup_key(&new_owner, &hash), 518400, 518400);
+            .extend_ttl(&dedup_key(&new_owner, &hash), TTL_THRESHOLD, TTL_TARGET);
 
         // Move owner index entry
         owner_index_remove(&env, &current_owner, asset_id);
@@ -691,7 +696,7 @@ impl AssetRegistry {
         env.storage().persistent().set(&asset_key(asset_id), &asset);
         env.storage()
             .persistent()
-            .extend_ttl(&asset_key(asset_id), 518400, 518400);
+            .extend_ttl(&asset_key(asset_id), TTL_THRESHOLD, TTL_TARGET);
 
         env.events().publish(
             (symbol_short!("TRANSFER"), asset_id),
@@ -750,7 +755,7 @@ impl AssetRegistry {
             .set(&asset_type_key(&asset_type), &true);
         env.storage()
             .persistent()
-            .extend_ttl(&asset_type_key(&asset_type), 518400, 518400);
+            .extend_ttl(&asset_type_key(&asset_type), TTL_THRESHOLD, TTL_TARGET);
         env.events().publish((ADD_TYPE_TOPIC,), (asset_type,));
     }
 
@@ -2834,8 +2839,8 @@ mod tests {
         // Simulate TTL boundary: advance ledger sequence past the minimum TTL
         // then verify get_admin still returns the correct admin
         env.ledger().with_mut(|li| {
-            li.sequence_number += 518400;
-            li.timestamp += 518400 * 5;
+            li.sequence_number += TTL_THRESHOLD;
+            li.timestamp += TTL_THRESHOLD * 5;
         });
 
         // get_admin must still resolve correctly (TTL was extended at init time)
