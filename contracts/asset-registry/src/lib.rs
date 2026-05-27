@@ -258,8 +258,8 @@ impl AssetRegistry {
 
         // Emit asset registration event
         env.events().publish(
-            (symbol_short!("REG_AST"), id),
-            (asset_type, owner.clone(), env.ledger().timestamp()),
+            (symbol_short!("reg_asset"),),
+            (id, owner.clone(), env.ledger().timestamp()),
         );
 
         id
@@ -1068,11 +1068,22 @@ mod tests {
         let asset_type = symbol_short!("GENSET");
         let metadata = String::from_str(&env, "Caterpillar 3516 Generator");
 
-        client.register_asset(&asset_type, &metadata, &owner);
+        let timestamp = env.ledger().timestamp();
+        let asset_id = client.register_asset(&asset_type, &metadata, &owner);
 
-        // Verify registration event was emitted
+        use soroban_sdk::TryIntoVal;
+        let reg_topic = symbol_short!("reg_asset");
         let events = env.events().all();
-        assert!(events.len() > 0);
+        let (_, topics, data) = events.last().unwrap();
+
+        let t0: Symbol = topics.get(0).unwrap().try_into_val(&env).unwrap();
+        assert_eq!(t0, reg_topic);
+
+        let (emitted_id, emitted_owner, emitted_timestamp): (u64, Address, u64) =
+            data.try_into_val(&env).unwrap();
+        assert_eq!(emitted_id, asset_id);
+        assert_eq!(emitted_owner, owner);
+        assert_eq!(emitted_timestamp, timestamp);
     }
 
     #[test]
@@ -1116,7 +1127,7 @@ mod tests {
         let client = AssetRegistryClient::new(&env, &contract_id);
 
         let admin = Address::generate(&env);
-        client.initialize_admin(&admin);
+        client.initialize_admin(&admin, &admin);
         client.add_asset_type(&admin, &symbol_short!("GENSET"));
 
         let owner = Address::generate(&env);
@@ -1837,7 +1848,7 @@ mod tests {
         let client = AssetRegistryClient::new(&env, &contract_id);
 
         let admin = Address::generate(&env);
-        client.initialize_admin(&admin);
+        client.initialize_admin(&admin, &admin);
         client.add_asset_type(&admin, &symbol_short!("GENSET"));
 
         let owner = Address::generate(&env);
@@ -2915,13 +2926,15 @@ mod tests {
         let asset_owner = Address::generate(&env);
 
         // Initialize both contracts
-        asset_client.initialize_admin(&admin);
+        asset_client.initialize_admin(&admin, &admin);
         asset_client.add_asset_type(&admin, &symbol_short!("GENSET"));
 
         let lifecycle_admin = Address::generate(&env);
+        let engineer_registry_id = Address::generate(&env);
         lifecycle_client.initialize(
+            &lifecycle_admin,
             &asset_registry_id,
-            &Address::generate(&env),
+            &engineer_registry_id,
             &lifecycle_admin,
             &100,
         );
@@ -2951,7 +2964,7 @@ mod tests {
         let asset_client = AssetRegistryClient::new(&env, &asset_registry_id);
 
         let admin = Address::generate(&env);
-        asset_client.initialize_admin(&admin);
+        asset_client.initialize_admin(&admin, &admin);
 
         // Try to get lifecycle score for non-existent asset
         let result = asset_client.try_get_lifecycle_score(&999, &lifecycle_id);
@@ -2985,7 +2998,7 @@ mod tests {
         // then verify get_admin still returns the correct admin
         env.ledger().with_mut(|li| {
             li.sequence_number += TTL_THRESHOLD;
-            li.timestamp += TTL_THRESHOLD * 5;
+            li.timestamp += (TTL_THRESHOLD as u64) * 5;
         });
 
         // get_admin must still resolve correctly (TTL was extended at init time)
@@ -3045,6 +3058,8 @@ mod tests {
             ))),
             "remove_asset_type must be blocked when assets of that type exist"
         );
+    }
+
     #[test]
     fn test_initialize_admin_rejects_non_deployer() {
         let env = Env::default();
@@ -3069,11 +3084,13 @@ mod tests {
         // Passing attacker as deployer but deployer's auth is not present — must fail.
         let result = client.try_initialize_admin(&deployer, &attacker);
         assert!(result.is_err(), "non-deployer must not be able to initialize");
+    }
+
     fn setup_with_types(env: &Env) -> (AssetRegistryClient, Address, Address) {
         let contract_id = env.register(AssetRegistry, ());
         let client = AssetRegistryClient::new(env, &contract_id);
         let admin = Address::generate(env);
-        client.initialize_admin(&admin);
+        client.initialize_admin(&admin, &admin);
         client.add_asset_type(&admin, &symbol_short!("GENSET"));
         client.add_asset_type(&admin, &symbol_short!("TURBINE"));
         (client, admin, Address::generate(env))
