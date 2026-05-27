@@ -167,6 +167,7 @@ impl AssetRegistry {
             panic_with_error!(&env, ContractError::EmptyMetadata);
         }
 
+        // Validate asset type against allowlist
         if !Self::is_valid_asset_type(env.clone(), asset_type.clone()) {
             panic_with_error!(&env, ContractError::InvalidAssetType);
         }
