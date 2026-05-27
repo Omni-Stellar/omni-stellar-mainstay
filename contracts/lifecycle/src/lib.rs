@@ -387,6 +387,7 @@ impl Lifecycle {
     /// # Arguments
     /// * `asset_registry` - Address of the asset registry contract
     /// * `engineer_registry` - Address of the engineer registry contract
+    /// * `deployer` - The address of the contract deployer; must sign this transaction.
     /// * `admin` - Address that will have administrative privileges
     /// * `max_history` - Maximum maintenance records per asset (0 for default 200)
     ///
@@ -394,11 +395,13 @@ impl Lifecycle {
     /// - [`ContractError::AlreadyInitialized`] if contract has already been initialized
     pub fn initialize(
         env: Env,
+        deployer: Address,
         asset_registry: Address,
         engineer_registry: Address,
         admin: Address,
         max_history: u32,
     ) {
+        deployer.require_auth();
         if env.storage().persistent().has(&CONFIG) {
             panic_with_error!(&env, ContractError::AlreadyInitialized);
         }
@@ -1730,6 +1733,7 @@ mod tests {
 
         let lifecycle = LifecycleClient::new(env, &lifecycle_id);
         lifecycle.initialize(
+            &admin,
             &asset_registry_id,
             &engineer_registry_id,
             &admin,
@@ -1737,7 +1741,7 @@ mod tests {
         );
 
         let asset_registry = AssetRegistryClient::new(env, &asset_registry_id);
-        asset_registry.initialize_admin(&asset_admin);
+        asset_registry.initialize_admin(&asset_admin, &asset_admin);
         asset_registry.add_asset_type(&asset_admin, &symbol_short!("GENSET"));
 
         (
@@ -1762,7 +1766,7 @@ mod tests {
         let issuer = Address::generate(env);
         let admin = Address::generate(env);
         let hash = BytesN::from_array(env, &[1u8; 32]);
-        registry_client.initialize_admin(&admin);
+        registry_client.initialize_admin(&admin, &admin);
         registry_client.add_trusted_issuer(&admin, &issuer);
         registry_client.register_engineer(&engineer, &hash, &issuer, &31_536_000);
         engineer
@@ -2878,7 +2882,7 @@ mod tests {
         let admin = Address::generate(&env);
 
         let lifecycle = LifecycleClient::new(&env, &lifecycle_id);
-        lifecycle.initialize(&asset_registry_id, &engineer_registry_id, &admin, &0u32);
+        lifecycle.initialize(&admin, &asset_registry_id, &engineer_registry_id, &admin, &0u32);
 
         let events = env.events().all();
         assert_eq!(events.len(), 1);
@@ -2895,7 +2899,7 @@ mod tests {
         let admin = Address::generate(&env);
 
         let lifecycle = LifecycleClient::new(&env, &lifecycle_id);
-        lifecycle.initialize(&asset_registry_id, &engineer_registry_id, &admin, &0u32);
+        lifecycle.initialize(&admin, &asset_registry_id, &engineer_registry_id, &admin, &0u32);
 
         // Try to initialize again
         let result =
@@ -3995,7 +3999,7 @@ mod tests {
         let admin = Address::generate(&env);
         let hash_v1 = BytesN::from_array(&env, &[1u8; 32]);
 
-        engineer_registry_client.initialize_admin(&admin);
+        engineer_registry_client.initialize_admin(&admin, &admin);
         engineer_registry_client.add_trusted_issuer(&admin, &issuer);
         engineer_registry_client.register_engineer(&engineer, &hash_v1, &issuer, &31_536_000);
 
@@ -4048,7 +4052,7 @@ mod tests {
         let issuer = Address::generate(&env);
         let admin = Address::generate(&env);
         let hash = BytesN::from_array(&env, &[1u8; 32]);
-        engineer_registry_client.initialize_admin(&admin);
+        engineer_registry_client.initialize_admin(&admin, &admin);
         engineer_registry_client.add_trusted_issuer(&admin, &issuer);
         engineer_registry_client.register_engineer(&engineer, &hash, &issuer, &1000);
 
@@ -4096,7 +4100,7 @@ mod tests {
         let issuer = Address::generate(&env);
         let eng_admin = Address::generate(&env);
         let hash = BytesN::from_array(&env, &[1u8; 32]);
-        engineer_registry_client.initialize_admin(&eng_admin);
+        engineer_registry_client.initialize_admin(&eng_admin, &eng_admin);
         engineer_registry_client.add_trusted_issuer(&eng_admin, &issuer);
         // Register with validity_period = 100 seconds
         engineer_registry_client.register_engineer(&engineer, &hash, &issuer, &100);
@@ -4141,7 +4145,7 @@ mod tests {
         let issuer = Address::generate(&env);
         let eng_admin = Address::generate(&env);
         let hash = BytesN::from_array(&env, &[1u8; 32]);
-        engineer_registry_client.initialize_admin(&eng_admin);
+        engineer_registry_client.initialize_admin(&eng_admin, &eng_admin);
         engineer_registry_client.add_trusted_issuer(&eng_admin, &issuer);
         // Register with validity_period = 100 seconds
         engineer_registry_client.register_engineer(&engineer, &hash, &issuer, &100);
@@ -4191,7 +4195,7 @@ mod tests {
         let engineer = Address::generate(&env);
         let issuer = Address::generate(&env);
         let admin = Address::generate(&env);
-        engineer_registry.initialize_admin(&admin);
+        engineer_registry.initialize_admin(&admin, &admin);
         engineer_registry.add_trusted_issuer(&admin, &issuer);
         engineer_registry.register_engineer(
             &engineer,
@@ -4619,7 +4623,7 @@ mod tests {
         let admin = Address::generate(&env);
 
         let lifecycle = LifecycleClient::new(&env, &lifecycle_id);
-        lifecycle.initialize(&asset_registry_id, &engineer_registry_id, &admin, &0u32);
+        lifecycle.initialize(&admin, &asset_registry_id, &engineer_registry_id, &admin, &0u32);
 
         // Verify registries are accessible normally
         assert_eq!(lifecycle.get_asset_registry(), asset_registry_id);
@@ -5387,7 +5391,7 @@ mod tests {
         let admin = Address::generate(&env);
 
         let client = LifecycleClient::new(&env, &lifecycle_id);
-        client.initialize(&asset_registry_id, &engineer_registry_id, &admin, &0u32);
+        client.initialize(&admin, &asset_registry_id, &engineer_registry_id, &admin, &0u32);
 
         // Pause the contract
         client.pause(&admin);
@@ -5508,7 +5512,7 @@ mod tests {
         let engineer = Address::generate(&env);
         let issuer = Address::generate(&env);
         let eng_admin = Address::generate(&env);
-        engineer_registry.initialize_admin(&eng_admin);
+        engineer_registry.initialize_admin(&eng_admin, &eng_admin);
         engineer_registry.add_trusted_issuer(&eng_admin, &issuer);
         engineer_registry.register_engineer(
             &engineer,
@@ -5579,7 +5583,7 @@ mod tests {
         let engineer = Address::generate(&env);
         let eng_admin = Address::generate(&env);
 
-        engineer_registry.initialize_admin(&eng_admin);
+        engineer_registry.initialize_admin(&eng_admin, &eng_admin);
         engineer_registry.add_trusted_issuer(&eng_admin, &issuer);
         let asset_id = asset_registry.register_asset(
             &symbol_short!("GENSET"),
@@ -5641,7 +5645,7 @@ mod tests {
         let engineer = Address::generate(&env);
         let eng_admin = Address::generate(&env);
 
-        engineer_registry.initialize_admin(&eng_admin);
+        engineer_registry.initialize_admin(&eng_admin, &eng_admin);
         engineer_registry.add_trusted_issuer(&eng_admin, &issuer);
         let asset_id = asset_registry.register_asset(
             &symbol_short!("GENSET"),
@@ -5849,5 +5853,31 @@ mod tests {
         // BUG: Currently, asset_id is STILL in engineer's history
         let history_after = lifecycle.get_eng_history_page(&engineer, &0, &10);
         assert!(!history_after.contains(asset_id), "Asset ID should be removed from engineer history after purge");
+    }
+
+    #[test]
+    fn test_initialize_rejects_non_deployer() {
+        let env = Env::default();
+        let asset_registry_id = env.register(AssetRegistry, ());
+        let engineer_registry_id = env.register(EngineerRegistry, ());
+        let lifecycle_id = env.register(Lifecycle, ());
+        let client = LifecycleClient::new(&env, &lifecycle_id);
+
+        let deployer = Address::generate(&env);
+        let attacker = Address::generate(&env);
+
+        use soroban_sdk::IntoVal;
+        env.mock_auths(&[soroban_sdk::testutils::MockAuth {
+            address: &attacker,
+            invoke: &soroban_sdk::testutils::MockAuthInvoke {
+                contract: &lifecycle_id,
+                fn_name: "initialize",
+                args: (&attacker, &asset_registry_id, &engineer_registry_id, &attacker, &0u32).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+
+        let result = client.try_initialize(&deployer, &asset_registry_id, &engineer_registry_id, &attacker, &0u32);
+        assert!(result.is_err(), "non-deployer must not be able to initialize");
     }
 }
