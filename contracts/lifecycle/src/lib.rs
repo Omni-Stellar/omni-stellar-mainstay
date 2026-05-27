@@ -886,6 +886,11 @@ impl Lifecycle {
     /// * `previous_owner` - Address of the owner before the transfer
     /// * `new_owner`      - Address of the owner after the transfer
     ///
+    /// # Events
+    /// Emits `(EVENT_XFER, asset_id)` with data `(previous_owner, new_owner, timestamp, sentinel_index)`
+    /// where `sentinel_index` is the zero-based position of the XFER sentinel in the history vec,
+    /// allowing indexers to directly correlate the event with the record.
+    ///
     /// # Panics
     /// - [`ContractError::NotInitialized`] if contract has not been initialized
     /// - [`ContractError::AssetNotFound`] if the asset does not exist
@@ -921,6 +926,7 @@ impl Lifecycle {
             history.remove(0);
         }
         history.push_back(sentinel);
+        let sentinel_index = history.len() - 1;
         env.storage()
             .persistent()
             .set(&history_key(asset_id), &history);
@@ -930,7 +936,7 @@ impl Lifecycle {
 
         env.events().publish(
             (EVENT_XFER, asset_id),
-            (previous_owner, new_owner, timestamp),
+            (previous_owner, new_owner, timestamp, sentinel_index),
         );
     }
 
@@ -5627,6 +5633,72 @@ mod tests {
         // Score and eligibility are preserved for the new owner
         assert!(lifecycle.get_collateral_score(&asset_id) > 0);
         assert_eq!(asset_registry.get_asset(&asset_id).owner, new_owner);
+    }
+
+    #[test]
+    fn test_record_transfer_event_includes_sentinel_index() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (lifecycle, asset_registry, engineer_registry, _) = setup(&env, 0);
+
+        let owner = Address::generate(&env);
+        let new_owner = Address::generate(&env);
+        let issuer = Address::generate(&env);
+        let engineer = Address::generate(&env);
+        let eng_admin = Address::generate(&env);
+
+        engineer_registry.initialize_admin(&eng_admin);
+        engineer_registry.add_trusted_issuer(&eng_admin, &issuer);
+        let asset_id = asset_registry.register_asset(
+            &symbol_short!("GENSET"),
+            &String::from_str(&env, "Generator XFER-IDX-001"),
+            &owner,
+        );
+        engineer_registry.register_engineer(
+            &engineer,
+            &BytesN::from_array(&env, &[2u8; 32]),
+            &issuer,
+            &31_536_000,
+        );
+
+        // Submit 2 records so the sentinel lands at index 2
+        lifecycle.submit_maintenance(
+            &asset_id,
+            &symbol_short!("INSPECT"),
+            &String::from_str(&env, "Pre-transfer inspection"),
+            &engineer,
+        );
+        lifecycle.submit_maintenance(
+            &asset_id,
+            &symbol_short!("OIL_CHG"),
+            &String::from_str(&env, "Oil change"),
+            &engineer,
+        );
+
+        asset_registry.transfer_asset(&asset_id, &owner, &new_owner);
+        lifecycle.record_transfer(&asset_id, &owner, &new_owner);
+
+        let history = lifecycle.get_maintenance_history(&asset_id);
+        let expected_index = (history.len() - 1) as u32;
+
+        let events = env.events().all();
+        let xfer_event = events
+            .iter()
+            .find(|(_, topics, _)| {
+                topics
+                    .get(0)
+                    .and_then(|v| v.try_into_val::<_, Symbol>(&env).ok())
+                    .map(|s| s == symbol_short!("XFER"))
+                    .unwrap_or(false)
+            })
+            .expect("XFER event not emitted");
+
+        let (_, _, data) = xfer_event;
+        let (_, _, _, emitted_index): (Address, Address, u64, u32) =
+            data.try_into_val(&env).unwrap();
+
+        assert_eq!(emitted_index, expected_index);
     }
 
     #[test]
