@@ -23,6 +23,8 @@ pub enum ContractError {
     TypeInUse = 10,
     EmptyMetadata = 11,
     SameOwner = 12,
+    TimelockNotExpired = 13,
+    ProposalNotFound = 14,
     AssetDecommissioned = 13,
 }
 
@@ -46,6 +48,9 @@ pub struct AssetInput {
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TimelockProposal {
+    pub proposed_at: u64,
+    pub executed: bool,
 pub enum AssetStatus {
     Active = 0,
     Decommissioned = 1,
@@ -54,6 +59,7 @@ pub enum AssetStatus {
 
 const ASSET_COUNT: Symbol = symbol_short!("A_COUNT");
 const PAUSED_KEY: Symbol = symbol_short!("PAUSED");
+const TIMELOCK_DELAY_SECS: u64 = 48 * 60 * 60;
 
 const ADMIN_KEY: Symbol = symbol_short!("ADMIN");
 const ASSET_TYPE_PREFIX: Symbol = symbol_short!("AST_TYPE");
@@ -72,6 +78,28 @@ fn asset_key(id: u64) -> (Symbol, u64) {
     (symbol_short!("ASSET"), id)
 }
 
+fn timelock_key(op: Symbol, asset_id: u64) -> (Symbol, Symbol, u64) {
+    (symbol_short!("TL_PROP"), op, asset_id)
+}
+
+fn require_timelock_ready(env: &Env, op: Symbol, asset_id: u64) {
+    let key = timelock_key(op, asset_id);
+    let mut proposal: TimelockProposal = env
+        .storage()
+        .persistent()
+        .get(&key)
+        .unwrap_or_else(|| panic_with_error!(env, ContractError::ProposalNotFound));
+    if proposal.executed {
+        panic_with_error!(env, ContractError::ProposalNotFound);
+    }
+    if env.ledger().timestamp().saturating_sub(proposal.proposed_at) < TIMELOCK_DELAY_SECS {
+        panic_with_error!(env, ContractError::TimelockNotExpired);
+    }
+    proposal.executed = true;
+    env.storage().persistent().set(&key, &proposal);
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
 /// Decommissioned flag key: asset_id → bool.
 fn decommissioned_key(asset_id: u64) -> (Symbol, u64) {
     (DECOMM_PREFIX, asset_id)
@@ -214,6 +242,39 @@ pub struct AssetRegistry;
 
 #[contractimpl]
 impl AssetRegistry {
+    pub fn propose_deregister_asset(env: Env, caller: Address, asset_id: u64) {
+        ensure_not_paused(&env);
+        let asset: Asset = env
+            .storage()
+            .persistent()
+            .get(&asset_key(asset_id))
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::AssetNotFound));
+        let admin = Self::get_admin(env.clone());
+        if caller == admin {
+            admin.require_auth();
+        } else if caller == asset.owner {
+            asset.owner.require_auth();
+        } else {
+            panic_with_error!(&env, ContractError::UnauthorizedOwner);
+        }
+        let key = timelock_key(DEREG_TOPIC, asset_id);
+        env.storage().persistent().set(
+            &key,
+            &TimelockProposal {
+                proposed_at: env.ledger().timestamp(),
+                executed: false,
+            },
+        );
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
+    }
+
+    pub fn execute_deregister_asset(env: Env, caller: Address, asset_id: u64) {
+        require_timelock_ready(&env, DEREG_TOPIC, asset_id);
+        Self::deregister_asset(env, caller, asset_id);
+    }
+
     /// Register a new asset with the given type, metadata, and owner.
     ///
     /// # Arguments
