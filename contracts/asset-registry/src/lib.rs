@@ -273,8 +273,8 @@ impl AssetRegistry {
 
         // Emit asset registration event
         env.events().publish(
-            (symbol_short!("REG_AST"), id),
-            (asset_type, owner.clone(), env.ledger().timestamp()),
+            (symbol_short!("reg_asset"),),
+            (id, owner.clone(), env.ledger().timestamp()),
         );
 
         id
@@ -1179,11 +1179,22 @@ mod tests {
         let asset_type = symbol_short!("GENSET");
         let metadata = String::from_str(&env, "Caterpillar 3516 Generator");
 
-        client.register_asset(&asset_type, &metadata, &owner);
+        let timestamp = env.ledger().timestamp();
+        let asset_id = client.register_asset(&asset_type, &metadata, &owner);
 
-        // Verify registration event was emitted
+        use soroban_sdk::TryIntoVal;
+        let reg_topic = symbol_short!("reg_asset");
         let events = env.events().all();
-        assert!(events.len() > 0);
+        let (_, topics, data) = events.last().unwrap();
+
+        let t0: Symbol = topics.get(0).unwrap().try_into_val(&env).unwrap();
+        assert_eq!(t0, reg_topic);
+
+        let (emitted_id, emitted_owner, emitted_timestamp): (u64, Address, u64) =
+            data.try_into_val(&env).unwrap();
+        assert_eq!(emitted_id, asset_id);
+        assert_eq!(emitted_owner, owner);
+        assert_eq!(emitted_timestamp, timestamp);
     }
 
     #[test]
@@ -3164,6 +3175,8 @@ mod tests {
         asset_client.add_asset_type(&admin, &symbol_short!("GENSET"));
 
         let lifecycle_admin = Address::generate(&env);
+        let engineer_registry_id = Address::generate(&env);
+        lifecycle_client.initialize(
         let deployer = Address::generate(&env);
         lifecycle_client.initialize(
             &deployer,
