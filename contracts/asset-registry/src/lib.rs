@@ -444,6 +444,14 @@ impl AssetRegistry {
         env.storage().persistent().get(&ASSET_COUNT).unwrap_or(0)
     }
 
+    /// Get the total count of registered assets.
+    ///
+    /// # Returns
+    /// The total number of assets that have been registered
+    pub fn get_asset_count(env: Env) -> u64 {
+        env.storage().persistent().get(&ASSET_COUNT).unwrap_or(0)
+    }
+
     /// Returns all asset IDs of the given type.
     pub fn get_assets_by_type(env: Env, asset_type: Symbol) -> Vec<u64> {
         let key = type_assets_key(&asset_type);
@@ -3058,12 +3066,14 @@ mod tests {
         asset_client.add_asset_type(&admin, &symbol_short!("GENSET"));
 
         let lifecycle_admin = Address::generate(&env);
+        let deployer = Address::generate(&env);
         lifecycle_client.initialize(
+            &deployer,
             &lifecycle_admin,
             &asset_registry_id,
             &engineer_registry_id,
             &lifecycle_admin,
-            &100,
+            &200,
         );
 
         // Register an asset
@@ -3349,5 +3359,46 @@ mod tests {
 
         let turbines = client.get_assets_by_type(&symbol_short!("TURBINE"));
         assert_eq!(turbines.len(), 1);
+    }
+
+    #[test]
+    fn test_get_asset_count() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize_admin(&admin, &admin);
+        client.add_asset_type(&admin, &symbol_short!("GENSET"));
+
+        // Counter starts at 0
+        assert_eq!(client.get_asset_count(), 0);
+
+        let owner = Address::generate(&env);
+
+        // Register first asset, count should be 1
+        client.register_asset(
+            &symbol_short!("GENSET"),
+            &String::from_str(&env, "Generator 1"),
+            &owner,
+        );
+        assert_eq!(client.get_asset_count(), 1);
+
+        // Register second asset, count should be 2
+        client.register_asset(
+            &symbol_short!("GENSET"),
+            &String::from_str(&env, "Generator 2"),
+            &owner,
+        );
+        assert_eq!(client.get_asset_count(), 2);
+
+        // Register third asset, count should be 3
+        client.register_asset(
+            &symbol_short!("GENSET"),
+            &String::from_str(&env, "Generator 3"),
+            &owner,
+        );
+        assert_eq!(client.get_asset_count(), 3);
     }
 }

@@ -49,6 +49,7 @@ fn engineer_key(addr: &Address) -> (Symbol, Address) {
 }
 
 const PAUSED_KEY: Symbol = symbol_short!("PAUSED");
+const ENGINEER_COUNT: Symbol = symbol_short!("ENG_CNT");
 const REG_ENG_TOPIC: Symbol = symbol_short!("REG_ENG");
 const REVOKE_TOPIC: Symbol = symbol_short!("REV_CRED");
 const MIN_VALIDITY_PERIOD: u64 = 86_400;
@@ -175,6 +176,13 @@ impl EngineerRegistry {
         env.storage()
             .persistent()
             .extend_ttl(&issuer_engineers_key(&issuer), TTL_THRESHOLD, TTL_TARGET);
+
+        // Increment engineer count
+        let count: u32 = env.storage().persistent().get(&ENGINEER_COUNT).unwrap_or(0);
+        env.storage().persistent().set(&ENGINEER_COUNT, &(count + 1));
+        env.storage()
+            .persistent()
+            .extend_ttl(&ENGINEER_COUNT, TTL_THRESHOLD, TTL_TARGET);
 
         // Emit engineer registration event
         env.events().publish(
@@ -640,6 +648,14 @@ impl EngineerRegistry {
     /// Get the number of engineers credentialed by a specific issuer.
     pub fn get_engineer_count_by_issuer(env: Env, issuer: Address) -> u32 {
         Self::get_engineers_by_issuer(env, issuer).len()
+    }
+
+    /// Get the total count of registered engineers.
+    ///
+    /// # Returns
+    /// The total number of engineers that have been registered
+    pub fn get_engineer_count(env: Env) -> u32 {
+        env.storage().persistent().get(&ENGINEER_COUNT).unwrap_or(0)
     }
 
     /// Admin-only function to upgrade the contract WASM to a new hash.
@@ -2520,6 +2536,34 @@ mod tests {
     }
 
     #[test]
+    fn test_get_engineer_count() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin) = setup(&env);
+
+        let issuer = Address::generate(&env);
+        client.add_trusted_issuer(&admin, &issuer);
+
+        // Counter starts at 0
+        assert_eq!(client.get_engineer_count(), 0);
+
+        // Register first engineer, count should be 1
+        let engineer1 = Address::generate(&env);
+        let hash1 = BytesN::from_array(&env, &[1u8; 32]);
+        client.register_engineer(&engineer1, &hash1, &issuer, &31_536_000);
+        assert_eq!(client.get_engineer_count(), 1);
+
+        // Register second engineer, count should be 2
+        let engineer2 = Address::generate(&env);
+        let hash2 = BytesN::from_array(&env, &[2u8; 32]);
+        client.register_engineer(&engineer2, &hash2, &issuer, &31_536_000);
+        assert_eq!(client.get_engineer_count(), 2);
+
+        // Register third engineer, count should be 3
+        let engineer3 = Address::generate(&env);
+        let hash3 = BytesN::from_array(&env, &[3u8; 32]);
+        client.register_engineer(&engineer3, &hash3, &issuer, &31_536_000);
+        assert_eq!(client.get_engineer_count(), 3);
     fn test_verify_engineer_distinguishes_not_found_from_revoked() {
         let env = Env::default();
         env.mock_all_auths();
