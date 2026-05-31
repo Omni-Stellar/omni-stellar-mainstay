@@ -2,7 +2,7 @@
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, panic_with_error, symbol_short, token,
-    Address, Env, Vec,
+    Address, Env, Symbol, Vec,
 };
 
 #[contracterror]
@@ -95,6 +95,11 @@ const ADMIN_KEY: soroban_sdk::Symbol = symbol_short!("ADMIN");
 const TOKEN_KEY: soroban_sdk::Symbol = symbol_short!("TOKEN");
 const SLASH_BAL: soroban_sdk::Symbol = symbol_short!("SL_BAL");
 const CONFIG_KEY: soroban_sdk::Symbol = symbol_short!("CONFIG");
+
+const LOAN_REQUESTED: Symbol = symbol_short!("loan_req");
+const LOAN_REPAID: Symbol = symbol_short!("loan_rep");
+const LOAN_SLASHED: Symbol = symbol_short!("loan_sls");
+const VOUCH_CREATED: Symbol = symbol_short!("vouch_cr");
 
 fn loan_key(borrower: &Address) -> (soroban_sdk::Symbol, Address) {
     (symbol_short!("LOAN"), borrower.clone())
@@ -326,6 +331,9 @@ impl LendingContract {
                 );
             }
         }
+
+        env.events()
+            .publish((LOAN_REPAID,), (borrower.clone(), total_yield));
     }
 
     /// Vouch for a borrower with a token stake.
@@ -504,6 +512,9 @@ impl LendingContract {
         env.storage()
             .persistent()
             .extend_ttl(&SLASH_BAL, TTL_THRESHOLD, TTL_TARGET);
+
+        env.events()
+            .publish((LOAN_SLASHED,), (borrower.clone(), slash_accum));
     }
 
     /// Admin-only: withdraw all accumulated slash balance to the admin address.
@@ -908,5 +919,172 @@ mod tests {
         let loan = client.get_loan(&borrower);
         assert!(loan.is_some());
         assert_eq!(loan.unwrap().status, LoanStatus::Repaid);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_request_loan_emits_event() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let deployer = Address::generate(&env);
+        let admin = Address::generate(&env);
+        let token_addr = Address::generate(&env);
+        let borrower = Address::generate(&env);
+
+        let contract_id = env.register(LendingContract, ());
+        let client = LendingContractClient::new(&env, &contract_id);
+
+        client.initialize(&deployer, &admin, &token_addr);
+
+        let amount = 1000u64;
+        client.request_loan(&borrower, &amount);
+
+        let events = env.events().all();
+        let loan_req_events: Vec<_> = events
+            .iter()
+            .filter(|e| {
+                if let soroban_sdk::xdr::ContractEvent::V0(v0) = &e.event {
+                    v0.topics.len() > 0
+                        && v0.topics.get(0).map_or(false, |t| {
+                            if let soroban_sdk::xdr::ScVal::Symbol(sym) = t {
+                                sym.0.as_slice() == b"loan_req"
+                            } else {
+                                false
+                            }
+                        })
+                } else {
+                    false
+                }
+            })
+            .collect();
+
+        assert!(!loan_req_events.is_empty(), "request_loan should emit event");
+    }
+
+    #[test]
+    fn test_vouch_emits_event() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let deployer = Address::generate(&env);
+        let admin = Address::generate(&env);
+        let token_addr = Address::generate(&env);
+        let borrower = Address::generate(&env);
+        let voucher = Address::generate(&env);
+
+        let contract_id = env.register(LendingContract, ());
+        let client = LendingContractClient::new(&env, &contract_id);
+
+        client.initialize(&deployer, &admin, &token_addr);
+        client.request_loan(&borrower, &1000u64);
+
+        let stake = 100u64;
+        client.vouch(&borrower, &voucher, &stake);
+
+        let events = env.events().all();
+        let vouch_events: Vec<_> = events
+            .iter()
+            .filter(|e| {
+                if let soroban_sdk::xdr::ContractEvent::V0(v0) = &e.event {
+                    v0.topics.len() > 0
+                        && v0.topics.get(0).map_or(false, |t| {
+                            if let soroban_sdk::xdr::ScVal::Symbol(sym) = t {
+                                sym.0.as_slice() == b"vouch_cr"
+                            } else {
+                                false
+                            }
+                        })
+                } else {
+                    false
+                }
+            })
+            .collect();
+
+        assert!(!vouch_events.is_empty(), "vouch should emit event");
+    }
+
+    #[test]
+    fn test_repay_emits_event() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let deployer = Address::generate(&env);
+        let admin = Address::generate(&env);
+        let token_addr = Address::generate(&env);
+        let borrower = Address::generate(&env);
+
+        let contract_id = env.register(LendingContract, ());
+        let client = LendingContractClient::new(&env, &contract_id);
+
+        client.initialize(&deployer, &admin, &token_addr);
+        client.request_loan(&borrower, &1000u64);
+
+        client.repay(&borrower);
+
+        let events = env.events().all();
+        let repay_events: Vec<_> = events
+            .iter()
+            .filter(|e| {
+                if let soroban_sdk::xdr::ContractEvent::V0(v0) = &e.event {
+                    v0.topics.len() > 0
+                        && v0.topics.get(0).map_or(false, |t| {
+                            if let soroban_sdk::xdr::ScVal::Symbol(sym) = t {
+                                sym.0.as_slice() == b"loan_rep"
+                            } else {
+                                false
+                            }
+                        })
+                } else {
+                    false
+                }
+            })
+            .collect();
+
+        assert!(!repay_events.is_empty(), "repay should emit event");
+    }
+
+    #[test]
+    fn test_slash_emits_event() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let deployer = Address::generate(&env);
+        let admin = Address::generate(&env);
+        let token_addr = Address::generate(&env);
+        let borrower = Address::generate(&env);
+
+        let contract_id = env.register(LendingContract, ());
+        let client = LendingContractClient::new(&env, &contract_id);
+
+        client.initialize(&deployer, &admin, &token_addr);
+        client.request_loan(&borrower, &1000u64);
+
+        client.slash(&admin, &borrower);
+
+        let events = env.events().all();
+        let slash_events: Vec<_> = events
+            .iter()
+            .filter(|e| {
+                if let soroban_sdk::xdr::ContractEvent::V0(v0) = &e.event {
+                    v0.topics.len() > 0
+                        && v0.topics.get(0).map_or(false, |t| {
+                            if let soroban_sdk::xdr::ScVal::Symbol(sym) = t {
+                                sym.0.as_slice() == b"loan_sls"
+                            } else {
+                                false
+                            }
+                        })
+                } else {
+                    false
+                }
+            })
+            .collect();
+
+        assert!(!slash_events.is_empty(), "slash should emit event");
     }
 }
