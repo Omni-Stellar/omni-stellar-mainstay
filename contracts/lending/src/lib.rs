@@ -188,6 +188,14 @@ impl LendingContract {
             }
         }
 
+        // #628: Check contract has sufficient balance before disbursing
+        let token_addr = get_token(&env);
+        let tok = token::Client::new(&env, &token_addr);
+        let contract_balance = tok.balance(&env.current_contract_address());
+        if contract_balance < (amount as i128) {
+            panic_with_error!(&env, ContractError::InsufficientFunds);
+        }
+
         let loan = Loan {
             borrower: borrower.clone(),
             amount,
@@ -197,6 +205,13 @@ impl LendingContract {
         env.storage()
             .persistent()
             .extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
+
+        // Transfer the loan amount to the borrower
+        tok.transfer(
+            &env.current_contract_address(),
+            &borrower,
+            &(amount as i128),
+        );
     }
 
     /// Repay the active loan and distribute 2% yield to all vouchers.
@@ -275,6 +290,19 @@ impl LendingContract {
     ///   this borrower
     pub fn vouch(env: Env, borrower: Address, voucher: Address, stake: u64) {
         voucher.require_auth();
+
+        // #629: Prevent borrower from vouching for themselves
+        if voucher == borrower {
+            panic_with_error!(&env, ContractError::DuplicateVouch);
+        }
+
+        // #630: Check if borrower already has an active loan
+        let loan_key = loan_key(&borrower);
+        if let Some(existing) = env.storage().persistent().get::<_, Loan>(&loan_key) {
+            if existing.status == LoanStatus::Active {
+                panic_with_error!(&env, ContractError::LoanAlreadyActive);
+            }
+        }
 
         if stake == 0 {
             panic_with_error!(&env, ContractError::ZeroStake);
@@ -400,6 +428,56 @@ impl LendingContract {
             env.storage()
                 .persistent()
                 .extend_ttl(&SLASH_BAL, TTL_THRESHOLD, TTL_TARGET);
+        }
+    }
+
+    /// Withdraw a vouch before a loan is requested (#631).
+    ///
+    /// Allows a voucher to reclaim their stake if no active loan exists.
+    /// Panics if an active loan is found.
+    pub fn withdraw_vouch(env: Env, borrower: Address, voucher: Address) {
+        voucher.require_auth();
+
+        // #631: Check no active loan exists
+        let loan_key = loan_key(&borrower);
+        if let Some(existing) = env.storage().persistent().get::<_, Loan>(&loan_key) {
+            if existing.status == LoanStatus::Active {
+                panic_with_error!(&env, ContractError::VouchWithdrawNotAllowed);
+            }
+        }
+
+        let key = vouches_key(&borrower);
+        let mut vouches: Vec<Vouch> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let mut found_index = None;
+        for (i, v) in vouches.iter().enumerate() {
+            if v.voucher == voucher {
+                found_index = Some(i);
+                break;
+            }
+        }
+
+        if let Some(idx) = found_index {
+            let vouch = vouches.get(idx).unwrap();
+            let stake = vouch.stake;
+
+            vouches.remove(idx);
+            env.storage().persistent().set(&key, &vouches);
+            env.storage()
+                .persistent()
+                .extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
+
+            let token_addr = get_token(&env);
+            let tok = token::Client::new(&env, &token_addr);
+            tok.transfer(
+                &env.current_contract_address(),
+                &voucher,
+                &(stake as i128),
+            );
         }
     }
 
