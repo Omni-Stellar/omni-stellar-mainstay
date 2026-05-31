@@ -394,4 +394,20 @@ impl LendingContract {
             .map(|loan| loan.status)
             .unwrap_or(LoanStatus::None)
     }
+
+    /// Check if a specific voucher has already vouched for a borrower.
+    pub fn vouch_exists(env: Env, voucher: Address, borrower: Address) -> bool {
+        let vouches: Vec<Vouch> = env
+            .storage()
+            .persistent()
+            .get(&vouches_key(&borrower))
+            .unwrap_or_else(|| Vec::new(&env));
+
+        for v in vouches.iter() {
+            if v.voucher == voucher {
+                return true;
+            }
+        }
+        false
+    }
 }
