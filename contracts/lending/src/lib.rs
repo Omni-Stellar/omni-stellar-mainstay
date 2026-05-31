@@ -102,6 +102,10 @@ fn vouches_key(borrower: &Address) -> (soroban_sdk::Symbol, Address) {
     (symbol_short!("VOUCHES"), borrower.clone())
 }
 
+fn voucher_history_key(voucher: &Address) -> (soroban_sdk::Symbol, Address) {
+    (symbol_short!("V_HIST"), voucher.clone())
+}
+
 fn get_admin(env: &Env) -> Address {
     env.storage()
         .persistent()
@@ -317,8 +321,12 @@ impl LendingContract {
             panic_with_error!(&env, ContractError::ZeroStake);
         }
 
-        // #624: Reject stakes that yield zero due to integer truncation.
-        if stake < MIN_VOUCH_STAKE {
+        let min_stake: u64 = env
+            .storage()
+            .persistent()
+            .get(&MIN_STAKE_KEY)
+            .unwrap_or(MIN_VOUCH_STAKE);
+        if stake < min_stake {
             panic_with_error!(&env, ContractError::StakeBelowMinimum);
         }
 
@@ -347,6 +355,18 @@ impl LendingContract {
         env.storage()
             .persistent()
             .extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
+
+        let hist_key = voucher_history_key(&voucher);
+        let mut history: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&hist_key)
+            .unwrap_or_else(|| Vec::new(&env));
+        history.push_back(borrower);
+        env.storage().persistent().set(&hist_key, &history);
+        env.storage()
+            .persistent()
+            .extend_ttl(&hist_key, TTL_THRESHOLD, TTL_TARGET);
     }
 
     /// Admin-only: mark a loan as defaulted and slash 50% of each voucher's stake.
