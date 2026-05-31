@@ -76,6 +76,7 @@ const ADMIN_KEY: soroban_sdk::Symbol = symbol_short!("ADMIN");
 const TOKEN_KEY: soroban_sdk::Symbol = symbol_short!("TOKEN");
 const SLASH_BAL: soroban_sdk::Symbol = symbol_short!("SL_BAL");
 const MIN_STAKE_KEY: soroban_sdk::Symbol = symbol_short!("MIN_STK");
+const MAX_LOAN_KEY: soroban_sdk::Symbol = symbol_short!("MAX_LN");
 
 fn loan_key(borrower: &Address) -> (soroban_sdk::Symbol, Address) {
     (symbol_short!("LOAN"), borrower.clone())
@@ -157,6 +158,15 @@ impl LendingContract {
             if existing.status == LoanStatus::Active {
                 panic_with_error!(&env, ContractError::LoanAlreadyActive);
             }
+        }
+
+        let max_loan: u64 = env
+            .storage()
+            .persistent()
+            .get(&MAX_LOAN_KEY)
+            .unwrap_or(u64::MAX);
+        if amount > max_loan {
+            panic_with_error!(&env, ContractError::UnauthorizedAdmin);
         }
 
         let loan = Loan {
@@ -430,5 +440,14 @@ impl LendingContract {
         env.storage()
             .persistent()
             .extend_ttl(&MIN_STAKE_KEY, TTL_THRESHOLD, TTL_TARGET);
+    }
+
+    /// Admin-only: set the maximum loan amount.
+    pub fn set_max_loan_amount(env: Env, admin: Address, amount: u64) {
+        require_admin(&env, &admin);
+        env.storage().persistent().set(&MAX_LOAN_KEY, &amount);
+        env.storage()
+            .persistent()
+            .extend_ttl(&MAX_LOAN_KEY, TTL_THRESHOLD, TTL_TARGET);
     }
 }
