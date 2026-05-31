@@ -382,4 +382,11 @@ impl LendingContract {
             .get(&SLASH_BAL)
             .unwrap_or(0u64)
     }
+
+    /// Returns the contract's current XLM balance.
+    pub fn get_contract_balance(env: Env) -> i128 {
+        let token_addr = get_token(&env);
+        let tok = token::Client::new(&env, &token_addr);
+        tok.balance(&env.current_contract_address())
+    }
 }
