@@ -77,6 +77,7 @@ const TOKEN_KEY: soroban_sdk::Symbol = symbol_short!("TOKEN");
 const SLASH_BAL: soroban_sdk::Symbol = symbol_short!("SL_BAL");
 
 const LOAN_REQUESTED: Symbol = symbol_short!("loan_req");
+const VOUCH_CREATED: Symbol = symbol_short!("vouch_cr");
 
 fn loan_key(borrower: &Address) -> (soroban_sdk::Symbol, Address) {
     (symbol_short!("LOAN"), borrower.clone())
@@ -274,6 +275,9 @@ impl LendingContract {
         env.storage()
             .persistent()
             .extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
+
+        env.events()
+            .publish((VOUCH_CREATED,), (borrower.clone(), voucher.clone(), stake));
     }
 
     /// Admin-only: mark a loan as defaulted and slash 50% of each voucher's stake.
@@ -431,5 +435,47 @@ mod tests {
             .collect();
 
         assert!(!loan_req_events.is_empty(), "request_loan should emit event");
+    }
+
+    #[test]
+    fn test_vouch_emits_event() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let deployer = Address::generate(&env);
+        let admin = Address::generate(&env);
+        let token_addr = Address::generate(&env);
+        let borrower = Address::generate(&env);
+        let voucher = Address::generate(&env);
+
+        let contract_id = env.register(LendingContract, ());
+        let client = LendingContractClient::new(&env, &contract_id);
+
+        client.initialize(&deployer, &admin, &token_addr);
+        client.request_loan(&borrower, &1000u64);
+
+        let stake = 100u64;
+        client.vouch(&borrower, &voucher, &stake);
+
+        let events = env.events().all();
+        let vouch_events: Vec<_> = events
+            .iter()
+            .filter(|e| {
+                if let soroban_sdk::xdr::ContractEvent::V0(v0) = &e.event {
+                    v0.topics.len() > 0
+                        && v0.topics.get(0).map_or(false, |t| {
+                            if let soroban_sdk::xdr::ScVal::Symbol(sym) = t {
+                                sym.0.as_slice() == b"vouch_cr"
+                            } else {
+                                false
+                            }
+                        })
+                } else {
+                    false
+                }
+            })
+            .collect();
+
+        assert!(!vouch_events.is_empty(), "vouch should emit event");
     }
 }
