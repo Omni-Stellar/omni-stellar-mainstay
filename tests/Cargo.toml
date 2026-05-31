@@ -22,3 +22,15 @@ path = "test_full_lifecycle_e2e.rs"
 [[test]]
 name = "test_lending_features"
 path = "test_lending_features.rs"
+
+[[test]]
+name = "test_loan_deadline"
+path = "test_loan_deadline.rs"
+
+[[test]]
+name = "test_emergency_pause"
+path = "test_emergency_pause.rs"
+
+[[test]]
+name = "test_admin_transfer"
+path = "test_admin_transfer.rs"
