@@ -168,6 +168,8 @@ impl LendingContract {
     /// The contract balance is then asserted to be ≥ total yield. This prevents
     /// the loop from panicking mid-execution when the contract is underfunded
     /// (#627).
+    /// 
+    /// The caller must match the loan's borrower address (#645).
     pub fn repay(env: Env, borrower: Address) {
         borrower.require_auth();
 
@@ -181,6 +183,9 @@ impl LendingContract {
         if loan.status != LoanStatus::Active {
             panic_with_error!(&env, ContractError::NoActiveLoan);
         }
+
+        // #645: Verify the caller matches the loan's borrower.
+        assert_eq!(borrower, loan.borrower);
 
         let vouches: Vec<Vouch> = env
             .storage()
