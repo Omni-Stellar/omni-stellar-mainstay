@@ -34,6 +34,10 @@ pub struct Asset {
     pub asset_id: u64,
     pub asset_type: Symbol,
     pub metadata: String,
+    /// Unique physical serial number of the asset (e.g. manufacturer plate number).
+    /// Used as the primary deduplication key so the same machine cannot be registered
+    /// twice even if its metadata description differs.
+    pub serial_number: String,
     pub owner: Address,
     pub registered_at: u64,
     pub metadata_updated_at: u64,
@@ -44,6 +48,7 @@ pub struct Asset {
 pub struct AssetInput {
     pub asset_type: Symbol,
     pub metadata: String,
+    pub serial_number: String,
 }
 
 #[contracttype]
@@ -108,6 +113,12 @@ fn decommissioned_key(asset_id: u64) -> (Symbol, u64) {
 /// Deduplication key: (owner, sha256(metadata)) → existing asset_id.
 fn dedup_key(owner: &Address, hash: &BytesN<32>) -> (Symbol, Address, BytesN<32>) {
     (symbol_short!("DEDUP"), owner.clone(), hash.clone())
+}
+
+/// Serial-number dedup key: sha256(serial_number) → existing asset_id.
+/// Prevents the same physical machine from being registered twice regardless of metadata.
+fn serial_dedup_key(hash: &BytesN<32>) -> (Symbol, BytesN<32>) {
+    (symbol_short!("SN_DEDUP"), hash.clone())
 }
 
 /// Owner index key: owner → Vec<u64> of asset IDs.
@@ -288,18 +299,27 @@ impl AssetRegistry {
     /// # Panics
     /// - [`ContractError::DuplicateAsset`] if the same owner tries to register identical metadata
     /// - [`ContractError::InvalidAssetType`] if the asset type is not in the allowlist
-    pub fn register_asset(env: Env, asset_type: Symbol, metadata: String, owner: Address) -> u64 {
+    pub fn register_asset(env: Env, asset_type: Symbol, metadata: String, serial_number: String, owner: Address) -> u64 {
         ensure_not_paused(&env);
         owner.require_auth();
 
         require_string_length(&metadata, "metadata", 256);
+        require_string_length(&serial_number, "serial_number", 64);
 
         // Validate asset type against allowlist
         if !Self::is_valid_asset_type(env.clone(), asset_type.clone()) {
             panic_with_error!(&env, ContractError::InvalidAssetType);
         }
 
-        // Deduplication: reject if this owner already registered identical metadata.
+        // Deduplication by serial number: same physical machine cannot be registered twice.
+        let sn_bytes = serial_number.clone().to_xdr(&env);
+        let sn_hash: BytesN<32> = env.crypto().sha256(&sn_bytes).into();
+        let sdk = serial_dedup_key(&sn_hash);
+        if env.storage().persistent().has(&sdk) {
+            panic_with_error!(&env, ContractError::DuplicateAsset);
+        }
+
+        // Secondary dedup: same owner + same metadata hash.
         let meta_bytes = metadata.clone().to_xdr(&env);
         let meta_hash: BytesN<32> = env.crypto().sha256(&meta_bytes).into();
         let dk = dedup_key(&owner, &meta_hash);
@@ -312,6 +332,7 @@ impl AssetRegistry {
             asset_id: id,
             asset_type: asset_type.clone(),
             metadata,
+            serial_number,
             owner: owner.clone(),
             registered_at: env.ledger().timestamp(),
             metadata_updated_at: env.ledger().timestamp(),
@@ -319,13 +340,15 @@ impl AssetRegistry {
         env.storage().persistent().set(&asset_key(id), &asset);
         env.storage()
             .persistent()
-            .extend_ttl(&asset_key(id), TTL_THRESHOLD, TTL_TARGET); // Extend TTL for persistent storage entries to prevent data loss
+            .extend_ttl(&asset_key(id), TTL_THRESHOLD, TTL_TARGET);
         env.storage().persistent().set(&ASSET_COUNT, &id);
         env.storage()
             .persistent()
             .extend_ttl(&ASSET_COUNT, TTL_THRESHOLD, TTL_TARGET);
         env.storage().persistent().set(&dk, &id);
-        env.storage().persistent().extend_ttl(&dk, 518400, 518400);
+        env.storage().persistent().extend_ttl(&dk, TTL_THRESHOLD, TTL_TARGET);
+        env.storage().persistent().set(&sdk, &id);
+        env.storage().persistent().extend_ttl(&sdk, TTL_THRESHOLD, TTL_TARGET);
 
         // Update owner index
         owner_index_add(&env, &owner, id);
@@ -360,14 +383,30 @@ impl AssetRegistry {
 
         let mut ids: Vec<u64> = Vec::new(&env);
         let mut batch_hashes: Vec<BytesN<32>> = Vec::new(&env);
+        let mut batch_sn_hashes: Vec<BytesN<32>> = Vec::new(&env);
 
         let mut next_id: u64 = env.storage().persistent().get(&ASSET_COUNT).unwrap_or(0);
 
         for asset_in in assets.iter() {
             require_string_length(&asset_in.metadata, "metadata", 256);
+            require_string_length(&asset_in.serial_number, "serial_number", 64);
             if !Self::is_valid_asset_type(env.clone(), asset_in.asset_type.clone()) {
                 panic_with_error!(&env, ContractError::InvalidAssetType);
             }
+
+            // Serial-number dedup (global)
+            let sn_bytes = asset_in.serial_number.clone().to_xdr(&env);
+            let sn_hash: BytesN<32> = env.crypto().sha256(&sn_bytes).into();
+            if env.storage().persistent().has(&serial_dedup_key(&sn_hash)) {
+                panic_with_error!(&env, ContractError::DuplicateAsset);
+            }
+            for seen in batch_sn_hashes.iter() {
+                if seen == sn_hash {
+                    panic_with_error!(&env, ContractError::DuplicateAsset);
+                }
+            }
+            batch_sn_hashes.push_back(sn_hash.clone());
+
             let meta_bytes = asset_in.metadata.clone().to_xdr(&env);
             let meta_hash: BytesN<32> = env.crypto().sha256(&meta_bytes).into();
 
@@ -392,6 +431,7 @@ impl AssetRegistry {
                 asset_id: id,
                 asset_type: asset_in.asset_type.clone(),
                 metadata: asset_in.metadata.clone(),
+                serial_number: asset_in.serial_number.clone(),
                 owner: owner.clone(),
                 registered_at: env.ledger().timestamp(),
                 metadata_updated_at: env.ledger().timestamp(),
@@ -406,6 +446,12 @@ impl AssetRegistry {
                 .set(&dedup_key(&owner, &meta_hash), &id);
             env.storage().persistent().extend_ttl(
                 &dedup_key(&owner, &meta_hash),
+                TTL_THRESHOLD,
+                TTL_TARGET,
+            );
+            env.storage().persistent().set(&serial_dedup_key(&sn_hash), &id);
+            env.storage().persistent().extend_ttl(
+                &serial_dedup_key(&sn_hash),
                 TTL_THRESHOLD,
                 TTL_TARGET,
             );
@@ -1171,6 +1217,23 @@ mod tests {
     use engineer_registry;
     use lifecycle;
 
+    fn unique_serial(env: &Env) -> String {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(1);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        String::from_str(env, &std::format!("SN-{n}"))
+    }
+
+    /// Wrapper: register_asset with an auto-generated unique serial number.
+    fn reg(client: &AssetRegistryClient, env: &Env, asset_type: Symbol, metadata: String, owner: &Address) -> u64 {
+        client.register_asset(&asset_type, &metadata, &unique_serial(&env), &unique_serial(env), owner)
+    }
+
+    /// Wrapper: try_register_asset with an auto-generated unique serial number.
+    fn try_reg(client: &AssetRegistryClient, env: &Env, asset_type: Symbol, metadata: String, owner: &Address) -> Result<u64, soroban_sdk::InvokeError> {
+        client.try_register_asset(&asset_type, &metadata, &unique_serial(&env), &unique_serial(env), owner)
+    }
+
     #[test]
     fn test_register_and_get_asset() {
         let env = Env::default();
@@ -1186,6 +1249,7 @@ mod tests {
         let id = client.register_asset(
             &symbol_short!("GENSET"),
             &String::from_str(&env, "Caterpillar 3516 Generator"),
+            &unique_serial(&env),
             &owner,
         );
         assert_eq!(id, 1);
@@ -1210,6 +1274,7 @@ mod tests {
         let id = client.register_asset(
             &symbol_short!("TURBINE"),
             &String::from_str(&env, "GE LM2500 Turbine"),
+            &unique_serial(&env),
             &expected_owner,
         );
 
@@ -1244,13 +1309,14 @@ mod tests {
 
         let owner = Address::generate(&env);
         let metadata = String::from_str(&env, "CAT-3516-SN123456");
+        let serial = String::from_str(&env, "SN-CAT-3516-001");
 
         // First registration succeeds
-        let id = client.register_asset(&symbol_short!("GENSET"), &metadata, &owner);
+        let id = client.register_asset(&symbol_short!("GENSET"), &metadata, &serial, &owner);
         assert_eq!(id, 1);
 
-        // Second registration with identical metadata by same owner is rejected
-        let result = client.try_register_asset(&symbol_short!("GENSET"), &metadata, &owner);
+        // Second registration with same serial is rejected (same physical machine)
+        let result = client.try_register_asset(&symbol_short!("GENSET"), &metadata, &serial, &owner);
         assert_eq!(
             result,
             Err(Ok(soroban_sdk::Error::from_contract_error(
@@ -1272,11 +1338,12 @@ mod tests {
 
         let owner = Address::generate(&env);
         let metadata = String::from_str(&env, "CAT-3516-DUPLICATE");
+        let serial = String::from_str(&env, "SN-CAT-3516-DUP");
 
-        let id = client.register_asset(&symbol_short!("GENSET"), &metadata, &owner);
+        let id = client.register_asset(&symbol_short!("GENSET"), &metadata, &serial, &owner);
         assert_eq!(id, 1);
 
-        let result = client.try_register_asset(&symbol_short!("GENSET"), &metadata, &owner);
+        let result = client.try_register_asset(&symbol_short!("GENSET"), &metadata, &serial, &owner);
         assert_eq!(
             result,
             Err(Ok(soroban_sdk::Error::from_contract_error(
@@ -1301,8 +1368,8 @@ mod tests {
         let metadata = String::from_str(&env, "CAT-3516-SN123456");
 
         // Different owners may register the same metadata (different physical assets)
-        let id_a = client.register_asset(&symbol_short!("GENSET"), &metadata, &owner_a);
-        let id_b = client.register_asset(&symbol_short!("GENSET"), &metadata, &owner_b);
+        let id_a = client.register_asset(&symbol_short!("GENSET"), &metadata, &String::from_str(&env, "SN-A-001"), &owner_a);
+        let id_b = client.register_asset(&symbol_short!("GENSET"), &metadata, &String::from_str(&env, "SN-B-001"), &owner_b);
         assert_ne!(id_a, id_b);
     }
 
@@ -1322,7 +1389,7 @@ mod tests {
         let metadata = String::from_str(&env, "Caterpillar 3516 Generator");
 
         let timestamp = env.ledger().timestamp();
-        let asset_id = client.register_asset(&asset_type, &metadata, &owner);
+        let asset_id = client.register_asset(&asset_type, &metadata, &unique_serial(&env), &owner);
 
         use soroban_sdk::TryIntoVal;
         let reg_topic = symbol_short!("reg_asset");
@@ -1354,7 +1421,7 @@ mod tests {
         let asset_type = symbol_short!("GENSET");
         let metadata = String::from_str(&env, "Caterpillar 3516 Generator");
 
-        let id = client.register_asset(&asset_type, &metadata, &owner);
+        let id = client.register_asset(&asset_type, &metadata, &unique_serial(&env), &owner);
 
         // Verify TTL is set for asset storage entry
         let asset_ttl = env.as_contract(&contract_id, || {
@@ -1385,7 +1452,7 @@ mod tests {
 
         let owner = Address::generate(&env);
         let metadata = String::from_str(&env, "Dedup TTL test asset");
-        client.register_asset(&symbol_short!("GENSET"), &metadata, &owner);
+        client.register_asset(&symbol_short!("GENSET"), &metadata, &unique_serial(&env), &owner);
 
         let meta_bytes = metadata.to_xdr(&env);
         let meta_hash: BytesN<32> = env.crypto().sha256(&meta_bytes).into();
@@ -1596,6 +1663,7 @@ mod tests {
         let id = client.register_asset(
             &symbol_short!("GENSET"),
             &String::from_str(&env, "Original spec"),
+            &unique_serial(&env),
             &owner,
         );
 
@@ -1623,6 +1691,7 @@ mod tests {
         let id = client.register_asset(
             &symbol_short!("GENSET"),
             &String::from_str(&env, "Original spec"),
+            &unique_serial(&env),
             &owner,
         );
 
@@ -1652,6 +1721,7 @@ mod tests {
         let id = client.register_asset(
             &symbol_short!("GENSET"),
             &String::from_str(&env, "Original spec"),
+            &unique_serial(&env),
             &owner,
         );
 
@@ -1676,6 +1746,7 @@ mod tests {
         let id = client.register_asset(
             &symbol_short!("GENSET"),
             &String::from_str(&env, "Original spec"),
+            &unique_serial(&env),
             &owner,
         );
 
@@ -1706,6 +1777,7 @@ mod tests {
         let id = client.register_asset(
             &symbol_short!("GENSET"),
             &String::from_str(&env, "Original spec"),
+            &unique_serial(&env),
             &owner,
         );
 
@@ -1757,6 +1829,7 @@ mod tests {
         let id = client.register_asset(
             &symbol_short!("GENSET"),
             &String::from_str(&env, "CAT-3516"),
+            &unique_serial(&env),
             &owner,
         );
 
@@ -1781,6 +1854,7 @@ mod tests {
         let id = client.register_asset(
             &symbol_short!("GENSET"),
             &String::from_str(&env, "CAT-3516"),
+            &unique_serial(&env),
             &owner,
         );
 
@@ -1812,6 +1886,7 @@ mod tests {
         let id = client.register_asset(
             &symbol_short!("GENSET"),
             &String::from_str(&env, "CAT-3516"),
+            &unique_serial(&env),
             &owner,
         );
 
@@ -1840,6 +1915,7 @@ mod tests {
         let id = client.register_asset(
             &symbol_short!("GENSET"),
             &String::from_str(&env, "CAT-3516"),
+            &unique_serial(&env),
             &owner,
         );
 
@@ -1864,11 +1940,11 @@ mod tests {
         let new_owner = Address::generate(&env);
         let metadata = String::from_str(&env, "CAT-3516");
 
-        let id = client.register_asset(&symbol_short!("GENSET"), &metadata, &owner);
+        let id = client.register_asset(&symbol_short!("GENSET"), &metadata, &unique_serial(&env), &owner);
         client.transfer_asset(&id, &owner, &new_owner);
 
         // Original owner can now register the same metadata again (dedup key was moved)
-        let id2 = client.register_asset(&symbol_short!("GENSET"), &metadata, &owner);
+        let id2 = client.register_asset(&symbol_short!("GENSET"), &metadata, &unique_serial(&env), &owner);
         assert_ne!(id, id2);
     }
 
@@ -1888,11 +1964,13 @@ mod tests {
         let id1 = client.register_asset(
             &symbol_short!("GENSET"),
             &String::from_str(&env, "Spec A"),
+            &unique_serial(&env),
             &owner,
         );
         client.register_asset(
             &symbol_short!("GENSET"),
             &String::from_str(&env, "Spec B"),
+            &unique_serial(&env),
             &owner,
         );
 
@@ -1922,6 +2000,7 @@ mod tests {
         let id = client.register_asset(
             &symbol_short!("GENSET"),
             &String::from_str(&env, "Turbine X"),
+            &unique_serial(&env),
             &owner,
         );
 
@@ -1954,11 +2033,13 @@ mod tests {
         let id1 = client.register_asset(
             &symbol_short!("GENSET"),
             &String::from_str(&env, "Asset Alpha"),
+            &unique_serial(&env),
             &owner,
         );
         let id2 = client.register_asset(
             &symbol_short!("TURBINE"),
             &String::from_str(&env, "Asset Beta"),
+            &unique_serial(&env),
             &owner,
         );
 
@@ -1996,6 +2077,7 @@ mod tests {
         let id = client.register_asset(
             &symbol_short!("GENSET"),
             &String::from_str(&env, "CAT-3516"),
+            &unique_serial(&env),
             &owner,
         );
 
@@ -2025,11 +2107,13 @@ mod tests {
         let retained_id = client.register_asset(
             &symbol_short!("GENSET"),
             &String::from_str(&env, "CAT-3516"),
+            &unique_serial(&env),
             &owner,
         );
         let transferred_id = client.register_asset(
             &symbol_short!("GENSET"),
             &String::from_str(&env, "CAT-3520"),
+            &unique_serial(&env),
             &owner,
         );
 
@@ -2068,6 +2152,7 @@ mod tests {
         let id = client.register_asset(
             &symbol_short!("GENSET"),
             &String::from_str(&env, "CAT-3516"),
+            &unique_serial(&env),
             &owner,
         );
 
@@ -2113,6 +2198,7 @@ mod tests {
         let id = client.register_asset(
             &symbol_short!("GENSET"),
             &String::from_str(&env, "CAT-3516"),
+            &unique_serial(&env),
             &owner,
         );
 
@@ -2143,15 +2229,15 @@ mod tests {
         let meta_b = String::from_str(&env, "Spec B");
 
         // Register with metadata A, then update to B
-        let id = client.register_asset(&symbol_short!("GENSET"), &meta_a, &owner);
+        let id = client.register_asset(&symbol_short!("GENSET"), &meta_a, &unique_serial(&env), &owner);
         client.update_asset_metadata(&id, &owner, &meta_b);
 
         // Old dedup key (A) is gone — owner can register metadata A again
-        let id2 = client.register_asset(&symbol_short!("GENSET"), &meta_a, &owner);
+        let id2 = client.register_asset(&symbol_short!("GENSET"), &meta_a, &unique_serial(&env), &owner);
         assert_ne!(id, id2);
 
         // New dedup key (B) is present — owner cannot register metadata B again
-        let result = client.try_register_asset(&symbol_short!("GENSET"), &meta_b, &owner);
+        let result = client.try_register_asset(&symbol_short!("GENSET"), &meta_b, &unique_serial(&env), &owner);
         assert_eq!(
             result,
             Err(Ok(soroban_sdk::Error::from_contract_error(
@@ -2189,6 +2275,7 @@ mod tests {
         let id = client.register_asset(
             &symbol_short!("GENSET"),
             &String::from_str(&env, "CAT-3516"),
+            &unique_serial(&env),
             &owner,
         );
 
@@ -2212,13 +2299,13 @@ mod tests {
         let metadata = String::from_str(&env, "CAT-3516");
 
         // Register asset
-        let id1 = client.register_asset(&symbol_short!("GENSET"), &metadata, &owner);
+        let id1 = client.register_asset(&symbol_short!("GENSET"), &metadata, &unique_serial(&env), &owner);
 
         // Deregister removes dedup key
         client.deregister_asset(&admin, &id1);
 
         // Same owner can now re-register the same metadata
-        let id2 = client.register_asset(&symbol_short!("GENSET"), &metadata, &owner);
+        let id2 = client.register_asset(&symbol_short!("GENSET"), &metadata, &unique_serial(&env), &owner);
         assert_ne!(id1, id2);
     }
 
@@ -2255,6 +2342,7 @@ mod tests {
         let id = client.register_asset(
             &symbol_short!("GENSET"),
             &String::from_str(&env, "CAT-3516"),
+            &unique_serial(&env),
             &owner,
         );
 
@@ -2288,7 +2376,7 @@ mod tests {
         let owner = Address::generate(&env);
         let new_owner = Address::generate(&env);
         let metadata = String::from_str(&env, "CAT-3516");
-        let id = client.register_asset(&symbol_short!("GENSET"), &metadata, &owner);
+        let id = client.register_asset(&symbol_short!("GENSET"), &metadata, &unique_serial(&env), &owner);
 
         client.transfer_asset(&id, &owner, &new_owner);
 
@@ -2320,6 +2408,7 @@ mod tests {
         let id = client.register_asset(
             &symbol_short!("GENSET"),
             &String::from_str(&env, "Original spec"),
+            &unique_serial(&env),
             &owner,
         );
 
@@ -2355,6 +2444,7 @@ mod tests {
         client.register_asset(
             &symbol_short!("GENSET"),
             &String::from_str(&env, "A"),
+            &unique_serial(&env),
             &owner,
         );
 
@@ -2471,6 +2561,7 @@ mod tests {
         let id = client.register_asset(
             &symbol_short!("GENSET"),
             &String::from_str(&env, "Base"),
+            &unique_serial(&env),
             &owner,
         );
 
@@ -2636,6 +2727,7 @@ mod tests {
         let single = client.register_asset(
             &symbol_short!("GENSET"),
             &String::from_str(&env, "first"),
+            &unique_serial(&env),
             &owner,
         );
         assert_eq!(single, 1);
@@ -2682,6 +2774,7 @@ mod tests {
         let result = client.try_register_asset(
             &valid_type,
             &String::from_str(&env, "Some metadata"),
+            &unique_serial(&env),
             &owner,
         );
         assert_eq!(
@@ -2699,6 +2792,7 @@ mod tests {
         let id = client.register_asset(
             &valid_type,
             &String::from_str(&env, "Some metadata"),
+            &unique_serial(&env),
             &owner,
         );
         assert_eq!(id, 1);
@@ -2707,6 +2801,7 @@ mod tests {
         let result = client.try_register_asset(
             &invalid_type,
             &String::from_str(&env, "Other metadata"),
+            &unique_serial(&env),
             &owner,
         );
         assert_eq!(
@@ -2725,6 +2820,7 @@ mod tests {
         let result = client.try_register_asset(
             &valid_type,
             &String::from_str(&env, "More metadata"),
+            &unique_serial(&env),
             &owner,
         );
         assert_eq!(
@@ -2781,6 +2877,7 @@ mod tests {
         let id = client.register_asset(
             &symbol_short!("GENSET"),
             &String::from_str(&env, "CAT-3516"),
+            &unique_serial(&env),
             &owner,
         );
 
@@ -2811,6 +2908,7 @@ mod tests {
         let id = client.register_asset(
             &symbol_short!("GENSET"),
             &String::from_str(&env, "CAT-3516"),
+            &unique_serial(&env),
             &owner,
         );
 
@@ -2833,6 +2931,7 @@ mod tests {
         let id = client.register_asset(
             &symbol_short!("GENSET"),
             &String::from_str(&env, "CAT-3516"),
+            &unique_serial(&env),
             &owner,
         );
 
@@ -2868,6 +2967,7 @@ mod tests {
         let id = client.register_asset(
             &symbol_short!("GENSET"),
             &String::from_str(&env, "CAT-3516"),
+            &unique_serial(&env),
             &owner,
         );
 
@@ -2917,6 +3017,7 @@ mod tests {
         let id = client.register_asset(
             &symbol_short!("GENSET"),
             &String::from_str(&env, "CAT-3516"),
+            &unique_serial(&env),
             &owner,
         );
 
@@ -3028,6 +3129,7 @@ mod tests {
         let result = client.try_register_asset(
             &symbol_short!("GENSET"),
             &String::from_str(&env, ""),
+            &unique_serial(&env),
             &owner,
         );
         assert_eq!(result, Err(Ok(ContractError::EmptyMetadata.into())));
@@ -3048,6 +3150,7 @@ mod tests {
         let id1 = client.register_asset(
             &symbol_short!("GENSET"),
             &String::from_str(&env, "Asset One"),
+            &unique_serial(&env),
             &owner,
         );
         assert_eq!(id1, 1);
@@ -3069,6 +3172,7 @@ mod tests {
         let id2 = client.register_asset(
             &symbol_short!("GENSET"),
             &String::from_str(&env, "Asset Two"),
+            &unique_serial(&env),
             &owner,
         );
         assert_eq!(
@@ -3110,6 +3214,7 @@ mod tests {
             client.try_register_asset(
                 &symbol_short!("GENSET"),
                 &String::from_str(&env, "test asset"),
+                &unique_serial(&env),
                 &owner,
             ),
             Err(Ok(soroban_sdk::Error::from_contract_error(
@@ -3318,6 +3423,7 @@ mod tests {
         client.register_asset(
             &symbol_short!("GENSET"),
             &String::from_str(&env, "CAT-3516"),
+            &unique_serial(&env),
             &owner,
         );
 
@@ -3367,6 +3473,7 @@ mod tests {
         let asset_id = asset_client.register_asset(
             &symbol_short!("GENSET"),
             &String::from_str(&env, "Test Asset"),
+            &unique_serial(&env),
             &asset_owner,
         );
 
@@ -3453,6 +3560,7 @@ mod tests {
         client.register_asset(
             &symbol_short!("GENSET"),
             &String::from_str(&env, "CAT-3516"),
+            &unique_serial(&env),
             &owner,
         );
 
@@ -3535,16 +3643,19 @@ mod tests {
         let id1 = client.register_asset(
             &symbol_short!("GENSET"),
             &String::from_str(&env, "Generator A"),
+            &unique_serial(&env),
             &owner,
         );
         let id2 = client.register_asset(
             &symbol_short!("GENSET"),
             &String::from_str(&env, "Generator B"),
+            &unique_serial(&env),
             &owner,
         );
         client.register_asset(
             &symbol_short!("TURBINE"),
             &String::from_str(&env, "Turbine X"),
+            &unique_serial(&env),
             &owner,
         );
 
@@ -3566,11 +3677,13 @@ mod tests {
         let id1 = client.register_asset(
             &symbol_short!("GENSET"),
             &String::from_str(&env, "Generator A"),
+            &unique_serial(&env),
             &owner,
         );
         let id2 = client.register_asset(
             &symbol_short!("GENSET"),
             &String::from_str(&env, "Generator B"),
+            &unique_serial(&env),
             &owner,
         );
 
@@ -3599,6 +3712,7 @@ mod tests {
             ids.push_back(client.register_asset(
                 &symbol_short!("GENSET"),
                 &String::from_str(&env, meta),
+                &unique_serial(&env),
                 &owner,
             ));
         }
@@ -3670,6 +3784,7 @@ mod tests {
         let asset_id = client.register_asset(
             &symbol_short!("GENSET"),
             &String::from_str(&env, "Active Generator"),
+            &unique_serial(&env),
             &owner,
         );
 
@@ -3692,6 +3807,7 @@ mod tests {
         let asset_id = client.register_asset(
             &symbol_short!("GENSET"),
             &String::from_str(&env, "Decomm Generator"),
+            &unique_serial(&env),
             &owner,
         );
 
@@ -3733,6 +3849,7 @@ mod tests {
         let asset_id = client.register_asset(
             &symbol_short!("GENSET"),
             &String::from_str(&env, "Maintained Generator"),
+            &unique_serial(&env),
             &owner,
         );
 
@@ -3759,6 +3876,7 @@ mod tests {
         let asset_id = client.register_asset(
             &symbol_short!("GENSET"),
             &String::from_str(&env, "Decomm Test"),
+            &unique_serial(&env),
             &owner,
         );
 
@@ -3785,6 +3903,7 @@ mod tests {
         let asset_id = client.register_asset(
             &symbol_short!("GENSET"),
             &String::from_str(&env, "Decomm Test"),
+            &unique_serial(&env),
             &owner,
         );
 
@@ -3834,6 +3953,7 @@ mod tests {
         let asset_id = client.register_asset(
             &symbol_short!("GENSET"),
             &String::from_str(&env, "Event Test"),
+            &unique_serial(&env),
             &owner,
         );
 
@@ -3852,6 +3972,7 @@ mod tests {
         client.register_asset(
             &symbol_short!("GENSET"),
             &String::from_str(&env, "Generator 1"),
+            &unique_serial(&env),
             &owner,
         );
         assert_eq!(client.get_asset_count(), 1);
@@ -3860,6 +3981,7 @@ mod tests {
         client.register_asset(
             &symbol_short!("GENSET"),
             &String::from_str(&env, "Generator 2"),
+            &unique_serial(&env),
             &owner,
         );
         assert_eq!(client.get_asset_count(), 2);
@@ -3868,6 +3990,7 @@ mod tests {
         client.register_asset(
             &symbol_short!("GENSET"),
             &String::from_str(&env, "Generator 3"),
+            &unique_serial(&env),
             &owner,
         );
         assert_eq!(client.get_asset_count(), 3);
