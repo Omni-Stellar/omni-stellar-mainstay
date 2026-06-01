@@ -116,6 +116,50 @@ Engineer (caller)
 
 ---
 
+## Sequence Diagrams
+
+### Asset Registration Flow
+```mermaid
+sequenceDiagram
+    participant Owner
+    participant AssetRegistry
+    Owner->>AssetRegistry: submit_asset_registration(metadata)
+    AssetRegistry->>AssetRegistry: validate uniqueness and compute hash
+    AssetRegistry->>AssetRegistry: persist asset record and update indexes
+    AssetRegistry-->>Owner: return asset_id
+```
+
+### Maintenance Submission Flow
+```mermaid
+sequenceDiagram
+    participant Engineer
+    participant Lifecycle
+    participant AssetRegistry
+    participant EngineerRegistry
+    Engineer->>Lifecycle: submit_maintenance(asset_id, task_type, notes)
+    Lifecycle->>AssetRegistry: get_asset(asset_id)
+    AssetRegistry-->>Lifecycle: return asset record
+    Lifecycle->>EngineerRegistry: verify_engineer(engineer_id)
+    EngineerRegistry-->>Lifecycle: verification result
+    Lifecycle->>Lifecycle: append maintenance record and update score
+    Lifecycle-->>Engineer: emit maintenance event
+```
+
+### DeFi Collateral Query Flow
+```mermaid
+sequenceDiagram
+    participant Borrower
+    participant Lifecycle
+    participant AssetRegistry
+    Borrower->>Lifecycle: get_collateral_score(asset_id)
+    Lifecycle->>AssetRegistry: get_asset(asset_id)
+    AssetRegistry-->>Lifecycle: return asset record
+    Lifecycle->>Lifecycle: read score and trend history
+    Lifecycle-->>Borrower: return collateral_score
+```
+
+---
+
 ## Deployment & Initialization
 
 Each contract is deployed independently. After deployment:

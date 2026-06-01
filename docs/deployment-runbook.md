@@ -8,6 +8,14 @@ Note: `scripts/deploy_testnet.sh` hard-requires `STELLAR_NETWORK=testnet` (from 
 - Stellar CLI installed and configured.
 - A functional identity (`deployer`) with enough lumens.
 
+## 0. Formal Security Audit Requirement
+omni-stellar-omni-stellar-mainstay handles real industrial asset records used as DeFi collateral. A formal Soroban security audit is required before Mainnet deployment.
+
+- Engage a Soroban-specialized audit firm.
+- Address all audit findings before mainnet deployment.
+- Publish the final audit report in `docs/audit-report.md`.
+- Complete this deployment checklist after the audit is finished.
+
 ## 1. Build Contracts
 Compile all contracts to optimized WASM:
 ```bash
