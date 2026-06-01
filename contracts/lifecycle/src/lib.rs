@@ -31,6 +31,8 @@ pub enum ContractError {
     ProposalNotFound = 17,
     EngineerNotAuthorized = 16,
     ScoreOverflow = 16,
+    /// Notes field exceeds the configured maximum length.
+    NotesTooLong = 18,
 }
 
 #[contracttype]
@@ -497,7 +499,7 @@ fn validate_notes_length(env: &Env, notes: &soroban_sdk::String, max: u32) {
         panic_with_error!(env, ContractError::InvalidConfig);
     }
     if notes.len() > max {
-        panic_with_error!(env, ContractError::InvalidConfig);
+        panic_with_error!(env, ContractError::NotesTooLong);
     }
 }
 
@@ -525,17 +527,33 @@ pub struct Lifecycle;
 
 #[contractimpl]
 impl Lifecycle {
+    /// Propose a configuration change to the Lifecycle contract using the admin timelock.
+    ///
+    /// # Arguments
+    /// * `admin` - The administrator requesting the config update
+    /// * `op` - Symbol representing the update operation
     pub fn propose_config_update(env: Env, admin: Address, op: Symbol) {
         ensure_not_paused(&env);
         require_admin(&env, &admin);
         store_timelock(&env, op);
     }
 
+    /// Execute a pending score increment update after the timelock expires.
+    ///
+    /// # Arguments
+    /// * `admin` - The administrator performing the update
+    /// * `score_increment` - New increment value for each maintenance task
     pub fn execute_update_score_increment(env: Env, admin: Address, score_increment: u32) {
         require_timelock_ready(&env, symbol_short!("SC_INC"));
         Self::update_score_increment(env, admin, score_increment);
     }
 
+    /// Execute a pending decay configuration update after the timelock expires.
+    ///
+    /// # Arguments
+    /// * `admin` - The administrator performing the update
+    /// * `decay_rate` - Points to deduct per decay interval
+    /// * `decay_interval` - Interval length in seconds used to compute decay
     pub fn execute_update_decay_config(
         env: Env,
         admin: Address,
@@ -546,33 +564,68 @@ impl Lifecycle {
         Self::update_decay_config(env, admin, decay_rate, decay_interval);
     }
 
+    /// Execute a pending eligibility threshold update after the timelock expires.
+    ///
+    /// # Arguments
+    /// * `admin` - The administrator performing the update
+    /// * `threshold` - New collateral eligibility threshold
     pub fn execute_update_eligibility(env: Env, admin: Address, threshold: u32) {
         require_timelock_ready(&env, symbol_short!("ELIG"));
         Self::update_eligibility_threshold(env, admin, threshold);
     }
 
+    /// Execute a pending max history update after the timelock expires.
+    ///
+    /// # Arguments
+    /// * `admin` - The administrator performing the update
+    /// * `new_max` - Maximum maintenance history entries per asset
     pub fn execute_update_max_history(env: Env, admin: Address, new_max: u32) {
         require_timelock_ready(&env, symbol_short!("MAX_HIST"));
         Self::update_max_history(env, admin, new_max);
     }
 
+    /// Execute a pending max notes length update after the timelock expires.
+    ///
+    /// # Arguments
+    /// * `admin` - The administrator performing the update
+    /// * `new_max` - Maximum length of maintenance notes
     pub fn execute_update_max_notes_length(env: Env, admin: Address, new_max: u32) {
         require_timelock_ready(&env, symbol_short!("MAX_NOTE"));
         Self::update_max_notes_length(env, admin, new_max);
     }
 
+    /// Execute a pending asset registry address update after the timelock expires.
+    ///
+    /// # Arguments
+    /// * `admin` - The administrator performing the update
+    /// * `new_registry` - Address of the new asset registry contract
     pub fn execute_update_asset_registry(env: Env, admin: Address, new_registry: Address) {
         require_timelock_ready(&env, symbol_short!("AST_REG"));
         Self::update_asset_registry(env, admin, new_registry);
     }
 
+    /// Execute a pending engineer registry address update after the timelock expires.
+    ///
+    /// # Arguments
+    /// * `admin` - The administrator performing the update
+    /// * `new_registry` - Address of the new engineer registry contract
     pub fn execute_update_engineer_registry(env: Env, admin: Address, new_registry: Address) {
         require_timelock_ready(&env, symbol_short!("ENG_REG"));
         Self::update_engineer_registry(env, admin, new_registry);
+    }
+
     /// Owner-approved per-asset authorization for maintenance submissions.
     ///
     /// A verified engineer must also be explicitly authorized by the current asset owner
     /// before submitting maintenance for that asset.
+    ///
+    /// # Arguments
+    /// * `owner` - The current owner of the asset
+    /// * `asset_id` - The unique identifier of the asset
+    /// * `engineer` - The engineer address being authorized
+    ///
+    /// # Panics
+    /// - [`ContractError::UnauthorizedOwner`] if the caller is not the asset owner
     pub fn authorize_engineer(env: Env, owner: Address, asset_id: u64, engineer: Address) {
         ensure_not_paused(&env);
         owner.require_auth();
@@ -593,6 +646,14 @@ impl Lifecycle {
     }
 
     /// Revoke an engineer's owner-approved authorization for a specific asset.
+    ///
+    /// # Arguments
+    /// * `owner` - The current owner of the asset
+    /// * `asset_id` - The unique identifier of the asset
+    /// * `engineer` - The engineer address whose authorization is being revoked
+    ///
+    /// # Panics
+    /// - [`ContractError::UnauthorizedOwner`] if the caller is not the asset owner
     pub fn revoke_engineer_auth(env: Env, owner: Address, asset_id: u64, engineer: Address) {
         ensure_not_paused(&env);
         owner.require_auth();
@@ -1288,7 +1349,6 @@ impl Lifecycle {
         // Validate records early before cross-contract calls
         require_non_empty_vec(&records, "records");
         for record in records.iter() {
-            require_string_length(&record.notes, "notes", config.max_notes_length);
             validate_notes_length(&env, &record.notes, config.max_notes_length);
             // Validate task type is known
             let _ = get_task_weight(&env, &record.task_type);
@@ -1407,7 +1467,7 @@ impl Lifecycle {
     /// - [`ContractError::AssetNotFound`] if no asset exists with the given ID
     pub fn get_maintenance_history(env: Env, asset_id: u64) -> Vec<MaintenanceRecord> {
         let asset_registry = get_asset_registry_addr(&env);
-        asset_registry::AssetRegistryClient::new(&env, &asset_registry).get_asset(&asset_id);
+        verify_asset_exists(&env, &asset_registry, &asset_id);
         env.storage()
             .persistent()
             .get(&history_key(asset_id))
@@ -1525,6 +1585,17 @@ impl Lifecycle {
         }
     }
 
+    /// Get collateral scores for multiple assets in a single call.
+    ///
+    /// # Arguments
+    /// * `asset_ids` - A list of asset IDs to query
+    ///
+    /// # Returns
+    /// A Vec containing the current collateral score for each requested asset
+    ///
+    /// # Panics
+    /// - [`ContractError::NotInitialized`] if the contract is not initialized
+    /// - [`ContractError::AssetNotFound`] if any asset does not exist
     pub fn get_collateral_score_batch(env: Env, asset_ids: Vec<u64>) -> Vec<u32> {
         // Ensure CONFIG is present (NotInitialized guard)
         env.storage()
@@ -1701,15 +1772,45 @@ impl Lifecycle {
     /// # Returns
     /// Total number of entries in the engineer's maintenance history.
     pub fn get_eng_maint_hist_count(env: Env, engineer: Address) -> u32 {
-    pub fn get_engineer_history_count(env: Env, engineer: Address) -> u32 {
-    pub fn get_eng_maint_count(env: Env, engineer: Address) -> u32 {
-    pub fn eng_maintenance_history_count(env: Env, engineer: Address) -> u32 {
         let history: Vec<u64> = env
             .storage()
             .persistent()
             .get(&engineer_history_key(&engineer))
             .unwrap_or_else(|| Vec::new(&env));
         history.len()
+    }
+
+    /// Alias for [`get_eng_maint_hist_count`].
+    ///
+    /// # Arguments
+    /// * `engineer` - The address of the engineer to query
+    ///
+    /// # Returns
+    /// Total number of entries in the engineer's maintenance history.
+    pub fn get_engineer_history_count(env: Env, engineer: Address) -> u32 {
+        Self::get_eng_maint_hist_count(env, engineer)
+    }
+
+    /// Alias for [`get_eng_maint_hist_count`].
+    ///
+    /// # Arguments
+    /// * `engineer` - The address of the engineer to query
+    ///
+    /// # Returns
+    /// Total number of entries in the engineer's maintenance history.
+    pub fn get_eng_maint_count(env: Env, engineer: Address) -> u32 {
+        Self::get_eng_maint_hist_count(env, engineer)
+    }
+
+    /// Alias for [`get_eng_maint_hist_count`].
+    ///
+    /// # Arguments
+    /// * `engineer` - The address of the engineer to query
+    ///
+    /// # Returns
+    /// Total number of entries in the engineer's maintenance history.
+    pub fn eng_maintenance_history_count(env: Env, engineer: Address) -> u32 {
+        Self::get_eng_maint_hist_count(env, engineer)
     }
 
     /// Get a paginated list of asset IDs that an engineer has worked on.
@@ -2190,11 +2291,21 @@ mod tests {
         )
     }
 
+    /// Generate a unique serial number string for each test asset registration.
+    fn unique_serial(env: &Env) -> String {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(1);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        String::from_str(env, &std::format!("SN-{n}"))
+    }
+
     fn register_asset(env: &Env, registry_client: &AssetRegistryClient) -> u64 {
         let owner = Address::generate(env);
+        let serial = unique_serial(env);
         registry_client.register_asset(
             &symbol_short!("GENSET"),
             &String::from_str(env, "Caterpillar 3516"),
+            &serial,
             &owner,
         )
     }
@@ -2204,9 +2315,11 @@ mod tests {
         registry_client: &AssetRegistryClient,
         owner: &Address,
     ) -> u64 {
+        let serial = unique_serial(env);
         registry_client.register_asset(
             &symbol_short!("GENSET"),
             &String::from_str(env, "Caterpillar 3516"),
+            &serial,
             owner,
         )
     }
@@ -2319,7 +2432,7 @@ mod tests {
         assert_eq!(
             result,
             Err(Ok(soroban_sdk::Error::from_contract_error(
-                asset_registry::ContractError::AssetNotFound as u32,
+                ContractError::AssetNotFound as u32,
             ))),
         );
     }
@@ -2485,7 +2598,7 @@ mod tests {
         assert_eq!(
             result,
             Err(Ok(soroban_sdk::Error::from_contract_error(
-                ContractError::InvalidConfig as u32,
+                ContractError::NotesTooLong as u32,
             ))),
         );
     }
@@ -4554,7 +4667,7 @@ mod tests {
         assert_eq!(
             result,
             Err(Ok(soroban_sdk::Error::from_contract_error(
-                ContractError::InvalidConfig as u32,
+                ContractError::NotesTooLong as u32,
             ))),
         );
     }
@@ -6778,6 +6891,57 @@ mod tests {
             1,
             "asset with maintenance history must not score 0 after decay"
         );
+    }
+
+    #[test]
+    fn test_collateral_score_never_exceeds_maximum_with_high_volume_maintenance() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, engineer_registry_client, admin) = setup(&env, 0);
+        asset_registry_client.add_asset_type(&admin, &symbol_short!("TURBINE"));
+
+        let owner_a = Address::generate(&env);
+        let asset_id_genset = asset_registry_client.register_asset(
+            &symbol_short!("GENSET"),
+            &String::from_str(&env, "Caterpillar 3516"),
+            &owner_a,
+        );
+
+        let owner_b = Address::generate(&env);
+        let asset_id_turbine = asset_registry_client.register_asset(
+            &symbol_short!("TURBINE"),
+            &String::from_str(&env, "Siemens SGT-800"),
+            &owner_b,
+        );
+
+        let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&owner_a, &asset_id_genset, &engineer);
+        client.authorize_engineer(&owner_b, &asset_id_turbine, &engineer);
+
+        for i in 0..110 {
+            let note = String::from_str(&env, &format!("Record {}", i));
+            client.submit_maintenance(
+                &asset_id_genset,
+                &symbol_short!("ENGINE"),
+                &note,
+                &engineer,
+            );
+            client.submit_maintenance(
+                &asset_id_turbine,
+                &symbol_short!("ENGINE"),
+                &note,
+                &engineer,
+            );
+        }
+
+        let score_genset = client.get_collateral_score(&asset_id_genset);
+        let score_turbine = client.get_collateral_score(&asset_id_turbine);
+
+        assert!(score_genset <= 100, "score must never exceed 100");
+        assert!(score_turbine <= 100, "score must never exceed 100");
+        assert_eq!(score_genset, 100, "high-volume maintenance should cap at 100");
+        assert_eq!(score_turbine, 100, "high-volume maintenance should cap at 100");
     }
 
     #[test]
