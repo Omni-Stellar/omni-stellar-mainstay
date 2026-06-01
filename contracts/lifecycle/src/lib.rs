@@ -1172,13 +1172,29 @@ impl Lifecycle {
         let asset_registry = get_asset_registry_addr(&env);
         verify_asset_exists(&env, &asset_registry, &asset_id);
 
-        // Cross-check engineer credential
+        // Cross-check engineer credential and check for grace period
         let registry_id = get_engineer_registry_addr(&env);
         let registry = engineer_registry::EngineerRegistryClient::new(&env, &registry_id);
-        match registry.verify_engineer(&engineer) {
-            None => panic_with_error!(&env, engineer_registry::ContractError::EngineerNotFound),
-            Some(false) => panic_with_error!(&env, ContractError::UnauthorizedEngineer),
-            Some(true) => {},
+        let cred_status = registry.get_credential_status(&engineer);
+        
+        match cred_status {
+            engineer_registry::CredentialStatus::Valid => {},
+            engineer_registry::CredentialStatus::GracePeriod => {
+                // Allow submission but emit warning event
+                env.events().publish(
+                    (symbol_short!("GRACE_WARN"), engineer.clone()),
+                    (asset_id, timestamp),
+                );
+            },
+            engineer_registry::CredentialStatus::HardExpired => {
+                panic_with_error!(&env, ContractError::UnauthorizedEngineer)
+            },
+            engineer_registry::CredentialStatus::Revoked => {
+                panic_with_error!(&env, ContractError::UnauthorizedEngineer)
+            },
+            engineer_registry::CredentialStatus::NotFound => {
+                panic_with_error!(&env, engineer_registry::ContractError::EngineerNotFound)
+            },
         }
         require_engineer_authorized(&env, asset_id, &engineer);
 
@@ -1358,14 +1374,31 @@ impl Lifecycle {
         let asset_registry = get_asset_registry_addr(&env);
         verify_asset_exists(&env, &asset_registry, &asset_id);
 
-        // Validate engineer credential
+        // Validate engineer credential and check for grace period
         let engineer_registry = get_engineer_registry_addr(&env);
         let engineer_registry_client =
             engineer_registry::EngineerRegistryClient::new(&env, &engineer_registry);
-        match engineer_registry_client.verify_engineer(&engineer) {
-            None => panic_with_error!(&env, engineer_registry::ContractError::EngineerNotFound),
-            Some(false) => panic_with_error!(&env, ContractError::UnauthorizedEngineer),
-            Some(true) => {},
+        let cred_status = engineer_registry_client.get_credential_status(&engineer);
+        
+        let timestamp = env.ledger().timestamp();
+        match cred_status {
+            engineer_registry::CredentialStatus::Valid => {},
+            engineer_registry::CredentialStatus::GracePeriod => {
+                // Allow submission but emit warning event
+                env.events().publish(
+                    (symbol_short!("GRACE_WARN"), engineer.clone()),
+                    (asset_id, timestamp),
+                );
+            },
+            engineer_registry::CredentialStatus::HardExpired => {
+                panic_with_error!(&env, ContractError::UnauthorizedEngineer)
+            },
+            engineer_registry::CredentialStatus::Revoked => {
+                panic_with_error!(&env, ContractError::UnauthorizedEngineer)
+            },
+            engineer_registry::CredentialStatus::NotFound => {
+                panic_with_error!(&env, engineer_registry::ContractError::EngineerNotFound)
+            },
         }
         require_engineer_authorized(&env, asset_id, &engineer);
 
@@ -1381,7 +1414,6 @@ impl Lifecycle {
         }
 
         // Write all records
-        let timestamp = env.ledger().timestamp();
         let mut score: u32 = env
             .storage()
             .persistent()
