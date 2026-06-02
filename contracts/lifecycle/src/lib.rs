@@ -1,83 +1,21 @@
 #![no_std]
 
+mod errors;
+mod scoring;
+mod types;
+
+use crate::errors::ContractError;
+use crate::scoring::{apply_decay, compute_decay, get_task_weight, score_history_push};
+use crate::types::{
+    BatchRecord, Config, DataKey, MaintenanceRecord, ScoreEntry, TimelockProposal,
+};
 use shared::validation::{
     require_non_empty_vec, require_positive_u32, require_positive_u64, require_string_length,
 };
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, panic_with_error, symbol_short, Address,
-    BytesN, Env, String, Symbol, Vec,
+    contract, contractimpl, panic_with_error, symbol_short, Address, BytesN, Env, String, Symbol,
+    Vec,
 };
-
-#[contracterror]
-#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
-#[repr(u32)]
-pub enum ContractError {
-    NoMaintenanceHistory = 1,
-    UnauthorizedEngineer = 2,
-    UnauthorizedAdmin = 3,
-    HistoryCapReached = 4,
-    AssetNotFound = 5,
-    NotInitialized = 6,
-    AlreadyInitialized = 7,
-    InvalidConfig = 8,
-    Paused = 9,
-    InvalidTaskType = 10,
-    PendingAdminAlreadyExists = 11,
-    ZeroAddress = 12,
-    SameRegistryAddress = 13,
-    IndexOutOfBounds = 14,
-    UnauthorizedOwner = 15,
-    TimelockNotExpired = 16,
-    ProposalNotFound = 17,
-    EngineerNotAuthorized = 16,
-    ScoreOverflow = 16,
-    /// Notes field exceeds the configured maximum length.
-    NotesTooLong = 18,
-}
-
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct MaintenanceRecord {
-    pub asset_id: u64,
-    pub task_type: Symbol,
-    pub notes: String,
-    pub engineer: Address,
-    pub timestamp: u64,
-}
-
-/// A point-in-time snapshot of the collateral score, recorded at each maintenance event.
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ScoreEntry {
-    pub timestamp: u64,
-    pub score: u32,
-}
-
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct BatchRecord {
-    pub task_type: Symbol,
-    pub notes: String,
-}
-
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Config {
-    pub admin: Address,
-    pub max_history: u32,
-    pub score_increment: u32,
-    pub decay_rate: u32,
-    pub decay_interval: u64,
-    pub eligibility_threshold: u32,
-    pub max_notes_length: u32,
-}
-
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct TimelockProposal {
-    pub proposed_at: u64,
-    pub executed: bool,
-}
 
 const ASSET_REGISTRY: Symbol = symbol_short!("REGISTRY");
 const ENG_REGISTRY: Symbol = symbol_short!("ENG_REG");
@@ -130,25 +68,6 @@ fn score_key(asset_id: u64) -> (Symbol, u64) {
 
 fn score_history_key(asset_id: u64) -> (Symbol, u64) {
     (symbol_short!("SCHIST"), asset_id)
-}
-
-/// Append a ScoreEntry to score history, evicting the oldest entry if the
-/// vec would exceed `max_history` entries.
-fn score_history_push(env: &Env, asset_id: u64, entry: ScoreEntry, max_history: u32) {
-    let key = score_history_key(asset_id);
-    let mut history: Vec<ScoreEntry> = env
-        .storage()
-        .persistent()
-        .get(&key)
-        .unwrap_or_else(|| Vec::new(env));
-    if max_history > 0 && history.len() >= max_history {
-        history.remove(0);
-    }
-    history.push_back(entry);
-    env.storage().persistent().set(&key, &history);
-    env.storage()
-        .persistent()
-        .extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
 }
 
 fn last_update_key(asset_id: u64) -> (Symbol, u64) {
@@ -314,184 +233,6 @@ fn require_timelock_ready(env: &Env, op: Symbol) {
     env.storage()
         .persistent()
         .extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
-}
-
-/// Compute the decayed score without writing anything to storage.
-/// Returns the score that *would* result from applying decay at the current ledger time.
-/// Compute collateral score by summing maintenance records weighted by recency.
-/// Uses a linear decay model where recent records contribute more than older ones.
-/// Each record's contribution = score_increment * recency_weight where:
-///   recency_weight = max(0, MAX_AGE_LEDGERS - (current_timestamp_in_ledgers - record_timestamp_in_ledgers)) / MAX_AGE_LEDGERS
-/// Timestamps are converted to ledgers (1 ledger ≈ 5 seconds) for recency calculation.
-/// The score is calculated fresh from all maintenance records to reflect actual maintenance recency.
-/// Returns the score capped at 100.
-fn compute_decay(env: &Env, asset_id: u64) -> u32 {
-    let history: Vec<MaintenanceRecord> = env
-        .storage()
-        .persistent()
-        .get(&history_key(asset_id))
-        .unwrap_or(Vec::new(env));
-
-    if history.is_empty() {
-        return 0;
-    }
-
-    let config: Config = env
-        .storage()
-        .persistent()
-        .get(&CONFIG)
-        .unwrap_or_else(|| panic_with_error!(env, ContractError::NotInitialized));
-
-    // Get current time in seconds and convert to ledgers (1 ledger ≈ 5 seconds)
-    let current_time_seconds = env.ledger().timestamp();
-    let current_ledger = current_time_seconds / 5;
-    let mut total_score: u32 = 0;
-
-    for record in history.iter() {
-        // Convert record timestamp to ledgers
-        let record_ledger = record.timestamp / 5;
-
-        // Calculate age in ledgers
-        let age_ledgers = current_ledger.saturating_sub(record_ledger);
-
-        // Calculate recency weight using linear decay: most recent records have weight 1,
-        // records at MAX_AGE_LEDGERS have weight 0, older records contribute nothing
-        let recency_weight = if age_ledgers >= MAX_AGE_LEDGERS {
-            0u64
-        } else {
-            MAX_AGE_LEDGERS - age_ledgers
-        };
-
-        // Each record contributes score_increment, weighted by recency
-        let base_score = config.score_increment as u64;
-
-        // Calculate weighted contribution: (score_increment * recency_weight) / MAX_AGE_LEDGERS
-        let contribution = (base_score * recency_weight) / MAX_AGE_LEDGERS;
-
-        // Add to total using checked_add to prevent overflow (panics with ScoreOverflow error)
-        total_score = total_score
-            .checked_add(contribution as u32)
-            .unwrap_or_else(|| panic_with_error!(env, ContractError::ScoreOverflow));
-    }
-
-    // Cap score at 100 to match eligibility threshold expectations
-    total_score.min(100)
-}
-
-fn apply_decay(
-    env: &Env,
-    asset_id: u64,
-    emit_event: bool,
-    update_on_zero_interval: bool,
-    max_history: u32,
-) -> u32 {
-    let current_score: u32 = env
-        .storage()
-        .persistent()
-        .get(&score_key(asset_id))
-        .unwrap_or(0u32);
-
-    if current_score == 0 {
-        if env.storage().persistent().has(&last_update_key(asset_id)) {
-            env.storage().persistent().extend_ttl(
-                &last_update_key(asset_id),
-                TTL_THRESHOLD,
-                TTL_TARGET,
-            );
-        }
-        return 0;
-    }
-
-    let last_update: u64 = env
-        .storage()
-        .persistent()
-        .get(&last_update_key(asset_id))
-        .unwrap_or(0u64);
-
-    let config: Config = env
-        .storage()
-        .persistent()
-        .get(&CONFIG)
-        .unwrap_or_else(|| panic_with_error!(env, ContractError::NotInitialized));
-
-    let current_time = env.ledger().timestamp();
-    let time_elapsed = current_time.saturating_sub(last_update);
-
-    // Calculate decay using configured rate and interval
-    let decay_intervals = time_elapsed / config.decay_interval;
-    if decay_intervals == 0 && !update_on_zero_interval {
-        env.storage()
-            .persistent()
-            .extend_ttl(&score_key(asset_id), TTL_THRESHOLD, TTL_TARGET);
-        env.storage().persistent().extend_ttl(
-            &last_update_key(asset_id),
-            TTL_THRESHOLD,
-            TTL_TARGET,
-        );
-        return current_score;
-    }
-
-    let total_decay = (decay_intervals as u32) * config.decay_rate;
-    let new_score = current_score.saturating_sub(total_decay);
-
-    env.storage()
-        .persistent()
-        .set(&score_key(asset_id), &new_score);
-    env.storage()
-        .persistent()
-        .extend_ttl(&score_key(asset_id), TTL_THRESHOLD, TTL_TARGET);
-    env.storage()
-        .persistent()
-        .set(&last_update_key(asset_id), &current_time);
-    env.storage()
-        .persistent()
-        .extend_ttl(&last_update_key(asset_id), TTL_THRESHOLD, TTL_TARGET);
-
-    score_history_push(
-        env,
-        asset_id,
-        ScoreEntry {
-            timestamp: current_time,
-            score: new_score,
-        },
-        max_history,
-    );
-
-    if emit_event {
-        env.events().publish(
-            (EVENT_DECAY, asset_id),
-            (current_score, new_score, current_time),
-        );
-    }
-
-    new_score
-}
-
-// Task type weight mapping for collateral scoring
-fn get_task_weight(env: &Env, task_type: &Symbol) -> u32 {
-    // Minor tasks: 2 points
-    if task_type == &symbol_short!("OIL_CHG")
-        || task_type == &symbol_short!("LUBE")
-        || task_type == &symbol_short!("INSPECT")
-    {
-        return 2;
-    }
-    // Medium tasks: 5 points
-    if task_type == &symbol_short!("FILTER")
-        || task_type == &symbol_short!("TUNE_UP")
-        || task_type == &symbol_short!("BRAKE")
-    {
-        return 5;
-    }
-    // Major tasks: 10 points
-    if task_type == &symbol_short!("ENGINE")
-        || task_type == &symbol_short!("OVERHAUL")
-        || task_type == &symbol_short!("REBUILD")
-    {
-        return 10;
-    }
-    // Unknown task types are not allowed
-    panic_with_error!(env, ContractError::InvalidTaskType);
 }
 
 fn validate_notes_length(env: &Env, notes: &soroban_sdk::String, max: u32) {
