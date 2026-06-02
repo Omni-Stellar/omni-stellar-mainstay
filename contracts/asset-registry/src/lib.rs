@@ -109,6 +109,8 @@ fn require_timelock_ready(env: &Env, op: Symbol, asset_id: u64) {
     env.storage()
         .persistent()
         .extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
+}
+
 /// Decommissioned flag key: asset_id → bool.
 fn decommissioned_key(asset_id: u64) -> (Symbol, u64) {
     (DECOMM_PREFIX, asset_id)
@@ -4111,4 +4113,5 @@ mod tests {
         );
         assert_eq!(client.get_asset_count(), 3);
     }
+}
 }
