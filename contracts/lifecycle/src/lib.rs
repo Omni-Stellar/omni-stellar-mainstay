@@ -2359,6 +2359,58 @@ mod tests {
     }
 
     #[test]
+    fn test_collateral_score_monotonically_increases_with_verified_maintenance() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
+        let owner = Address::generate(&env);
+        let asset_id = asset_registry_client.register_asset(
+            &symbol_short!("GENSET"),
+            &String::from_str(&env, "Caterpillar 3516"),
+            &unique_serial(&env),
+            &owner,
+        );
+        let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&owner, &asset_id, &engineer);
+
+        let task_types = [
+            symbol_short!("OIL_CHG"),
+            symbol_short!("FILTER"),
+            symbol_short!("ENGINE"),
+            symbol_short!("INSPECT"),
+        ];
+        let notes = [
+            "Oil change",
+            "Filter replacement",
+            "Engine overhaul",
+            "Inspection follow-up",
+        ];
+
+        let mut previous_score = client.get_collateral_score(&asset_id);
+        for (task_type, note) in task_types.iter().zip(notes.iter()) {
+            client.submit_maintenance(
+                &asset_id,
+                task_type,
+                &String::from_str(&env, note),
+                &engineer,
+            );
+            env.ledger().with_mut(|li| li.timestamp += 1);
+
+            let current_score = client.get_collateral_score(&asset_id);
+            assert!(
+                current_score >= previous_score,
+                "Collateral score must not decrease after additional verified maintenance: {} -> {}",
+                previous_score,
+                current_score,
+            );
+            previous_score = current_score;
+        }
+
+        assert_eq!(client.get_maintenance_history(&asset_id).len(), 4);
+    }
+
+    #[test]
     fn test_authorized_engineer_can_submit_maintenance() {
         let env = Env::default();
         env.mock_all_auths();
