@@ -126,15 +126,9 @@ fn engineer_history_add(env: &Env, engineer: &Address, asset_id: u64, max_histor
 fn engineer_history_remove(env: &Env, engineer: &Address, asset_id: u64) {
     let key = engineer_history_key(engineer);
     if let Some(mut ids) = env.storage().persistent().get::<_, Vec<u64>>(&key) {
-        let mut index = None;
-        for i in 0..ids.len() {
-            if ids.get(i).unwrap() == asset_id {
-                index = Some(i);
-                break;
-            }
-        }
-        if let Some(i) = index {
-            ids.remove(i);
+        let initial_len = ids.len();
+        ids.retain(|id| id != &asset_id);
+        if ids.len() < initial_len {
             env.storage().persistent().set(&key, &ids);
             env.storage()
                 .persistent()
