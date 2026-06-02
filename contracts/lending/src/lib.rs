@@ -33,6 +33,12 @@ pub enum ContractError {
     InvalidAdminAddress = 11,
     /// Token address is invalid (zero address).
     InvalidTokenAddress = 12,
+    /// Contract is paused.
+    ContractPaused = 13,
+    /// Too many vouchers for this borrower.
+    TooManyVouchers = 14,
+    /// Voucher withdrawal not allowed.
+    VouchWithdrawNotAllowed = 15,
 }
 
 #[contracttype]
@@ -95,6 +101,12 @@ const ADMIN_KEY: soroban_sdk::Symbol = symbol_short!("ADMIN");
 const TOKEN_KEY: soroban_sdk::Symbol = symbol_short!("TOKEN");
 const SLASH_BAL: soroban_sdk::Symbol = symbol_short!("SL_BAL");
 const CONFIG_KEY: soroban_sdk::Symbol = symbol_short!("CONFIG");
+const PAUSED_KEY: soroban_sdk::Symbol = symbol_short!("PAUSED");
+const SLASH_BPS_KEY: soroban_sdk::Symbol = symbol_short!("SL_BPS");
+const LOAN_DURATION_KEY: soroban_sdk::Symbol = symbol_short!("LOAN_DUR");
+const MIN_STAKE_KEY: soroban_sdk::Symbol = symbol_short!("MIN_STK");
+const YIELD_BPS_KEY: soroban_sdk::Symbol = symbol_short!("YIELD_BPS");
+const YIELD_NUMERATOR: u64 = DEFAULT_YIELD_NUMERATOR;
 
 const LOAN_REQUESTED: Symbol = symbol_short!("loan_req");
 const LOAN_REPAID: Symbol = symbol_short!("loan_rep");
@@ -103,6 +115,10 @@ const VOUCH_CREATED: Symbol = symbol_short!("vouch_cr");
 
 fn loan_key(borrower: &Address) -> (soroban_sdk::Symbol, Address) {
     (symbol_short!("LOAN"), borrower.clone())
+}
+
+fn borrower_key(borrower: &Address) -> (soroban_sdk::Symbol, Address) {
+    (symbol_short!("BORR"), borrower.clone())
 }
 
 fn vouches_key(borrower: &Address) -> (soroban_sdk::Symbol, Address) {
@@ -183,14 +199,6 @@ impl LendingContract {
 
         if env.storage().persistent().has(&ADMIN_KEY) {
             panic_with_error!(&env, ContractError::AlreadyInitialized);
-        }
-
-        // #641: Validate admin and token addresses are not zero addresses.
-        if admin == Address::from_contract_id(&env, &[0u8; 32]) {
-            panic_with_error!(&env, ContractError::InvalidAdminAddress);
-        }
-        if token == Address::from_contract_id(&env, &[0u8; 32]) {
-            panic_with_error!(&env, ContractError::InvalidTokenAddress);
         }
 
         env.storage().persistent().set(&ADMIN_KEY, &admin);
@@ -571,7 +579,7 @@ impl LendingContract {
         let mut found_index = None;
         for (i, v) in vouches.iter().enumerate() {
             if v.voucher == voucher {
-                found_index = Some(i);
+                found_index = Some(i as u32);
                 break;
             }
         }
@@ -642,7 +650,7 @@ impl LendingContract {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use soroban_sdk::testutils::Address as _;
+    use soroban_sdk::testutils::{Address as _, Events};
 
     #[test]
     fn test_is_initialized() {
@@ -723,11 +731,6 @@ mod tests {
         let final_balance = client.get_slash_balance();
         assert_eq!(final_balance, 0);
     }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
 
     fn setup() -> (Env, Address, Address, Address, Address) {
         let env = Env::default();
@@ -757,9 +760,7 @@ mod tests {
         assert_eq!(loan1.amount, 1000);
         assert_eq!(loan1.status, LoanStatus::Active);
 
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            client.request_loan(&borrower, &2000);
-        }));
+        let result = client.try_request_loan(&borrower, &2000);
         assert!(result.is_err());
 
         let loan2 = client.get_loan(&borrower).unwrap();
@@ -777,9 +778,7 @@ mod tests {
 
         client.request_loan(&borrower1, &1000);
 
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            client.repay(&borrower2);
-        }));
+        let result = client.try_repay(&borrower2);
         assert!(result.is_err());
 
         let loan = client.get_loan(&borrower1).unwrap();
@@ -795,11 +794,6 @@ mod tests {
     }
 }
 
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use soroban_sdk::testutils::{Address as _, Ledger};
 
     fn setup_contract(env: &Env) -> (Address, Address, Address) {
         let admin = Address::generate(env);
@@ -833,9 +827,7 @@ mod tests {
 
         // Try to add the 101st voucher - should fail
         let extra_voucher = Address::generate(&env);
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            client.vouch(&borrower, &extra_voucher, &100);
-        }));
+        let result = client.try_vouch(&borrower, &extra_voucher, &100);
 
         assert!(result.is_err());
     }
@@ -921,10 +913,6 @@ mod tests {
         assert_eq!(loan.unwrap().status, LoanStatus::Repaid);
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
 
     #[test]
     fn test_request_loan_emits_event() {
