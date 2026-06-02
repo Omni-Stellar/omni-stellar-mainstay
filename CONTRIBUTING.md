@@ -12,6 +12,36 @@ Thank you for your interest in contributing to omni-stellar-omni-stellar-mainsta
 - Provide a concise summary of the change.
 - Describe how the change was tested or validated.
 - Include any relevant docs updates.
+- **Update CHANGELOG.md** with your changes (see [Changelog Updates](#changelog-updates) below).
+
+## Changelog updates
+
+All notable changes must be documented in `CHANGELOG.md` following the [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) format.
+
+### What to document
+
+Document changes in the following categories (when applicable):
+- **Added**: New features or functionality
+- **Changed**: Changes to existing functionality
+- **Deprecated**: Features marked for removal
+- **Removed**: Removed features or functionality
+- **Fixed**: Bug fixes
+- **Security**: Security-related changes
+
+### How to update the changelog
+
+1. Locate the `## [Unreleased]` section at the top of `CHANGELOG.md`
+2. Add an entry under the appropriate category
+3. Use clear, user-facing language (not implementation details)
+4. Link to relevant issues or PRs when applicable
+
+### Example
+
+```markdown
+### Added
+- New collateral scoring algorithm for improved asset valuation
+- Support for multi-signature authorization on lending contracts
+```
 
 ## Code style
 - Maintain consistent formatting.
