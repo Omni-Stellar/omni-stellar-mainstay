@@ -49,6 +49,16 @@ pub enum EngineerStatus {
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CredentialStatus {
+    Valid = 0,
+    GracePeriod = 1,
+    HardExpired = 2,
+    Revoked = 3,
+    NotFound = 4,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TimelockProposal {
     pub proposed_at: u64,
     pub executed: bool,
@@ -69,6 +79,8 @@ const REVOKE_TOPIC: Symbol = symbol_short!("REV_CRED");
 const MIN_VALIDITY_PERIOD: u64 = 86_400;
 const EVENT_PROP_ADMIN: Symbol = symbol_short!("PROP_ADM");
 const TIMELOCK_DELAY_SECS: u64 = 48 * 60 * 60;
+/// Grace period allowing engineers to work after credential expiry (7 days).
+const GRACE_PERIOD_SECS: u64 = 7 * 86_400;
 
 /// Soroban persistent-storage TTL constants.
 /// 1 ledger ≈ 5 seconds → 518_400 ledgers ≈ 30 days.
@@ -472,6 +484,39 @@ impl EngineerRegistry {
                 }
             }
             None => EngineerStatus::NotFound,
+        }
+    }
+
+    /// Get the detailed credential status with grace period support.
+    /// Distinguishes between valid, in grace period, hard-expired, revoked, and not found.
+    /// Grace period: [`GRACE_PERIOD_SECS`] (7 days) after expiry allows continued operations.
+    ///
+    /// # Arguments
+    /// * `engineer` - The address of the engineer to check
+    ///
+    /// # Returns
+    /// A CredentialStatus enum with the detailed credential state
+    pub fn get_credential_status(env: Env, engineer: Address) -> CredentialStatus {
+        match env
+            .storage()
+            .persistent()
+            .get::<_, Engineer>(&engineer_key(&engineer))
+        {
+            Some(e) => {
+                if !e.active {
+                    CredentialStatus::Revoked
+                } else {
+                    let now = env.ledger().timestamp();
+                    if now < e.expires_at {
+                        CredentialStatus::Valid
+                    } else if now < e.expires_at + GRACE_PERIOD_SECS {
+                        CredentialStatus::GracePeriod
+                    } else {
+                        CredentialStatus::HardExpired
+                    }
+                }
+            }
+            None => CredentialStatus::NotFound,
         }
     }
 
@@ -2794,5 +2839,206 @@ mod tests {
             None,
             "never-registered engineer should still return None after other operations"
         );
+    }
+
+    // --- Grace Period Tests ---
+
+    #[test]
+    fn test_get_credential_status_valid() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin) = setup(&env);
+
+        let engineer = Address::generate(&env);
+        let issuer = Address::generate(&env);
+        let hash = BytesN::from_array(&env, &[1u8; 32]);
+
+        client.add_trusted_issuer(&admin, &issuer);
+        client.register_engineer(&engineer, &hash, &issuer, &86_400);
+
+        assert_eq!(
+            client.get_credential_status(&engineer),
+            CredentialStatus::Valid
+        );
+    }
+
+    #[test]
+    fn test_get_credential_status_in_grace_period() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin) = setup(&env);
+
+        let engineer = Address::generate(&env);
+        let issuer = Address::generate(&env);
+        let hash = BytesN::from_array(&env, &[1u8; 32]);
+
+        client.add_trusted_issuer(&admin, &issuer);
+        let base_time = env.ledger().timestamp();
+        let validity_period = 86_400; // 1 day
+        client.register_engineer(&engineer, &hash, &issuer, &validity_period);
+
+        // Advance to just after expiry but within grace period
+        // Grace period is 7 days (604_800 seconds)
+        env.ledger()
+            .set_timestamp(base_time + validity_period + 100_000); // 1 day + ~1.15 days
+
+        assert_eq!(
+            client.get_credential_status(&engineer),
+            CredentialStatus::GracePeriod
+        );
+    }
+
+    #[test]
+    fn test_get_credential_status_hard_expired() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin) = setup(&env);
+
+        let engineer = Address::generate(&env);
+        let issuer = Address::generate(&env);
+        let hash = BytesN::from_array(&env, &[1u8; 32]);
+
+        client.add_trusted_issuer(&admin, &issuer);
+        let base_time = env.ledger().timestamp();
+        let validity_period = 86_400; // 1 day
+        client.register_engineer(&engineer, &hash, &issuer, &validity_period);
+
+        // Advance past grace period (7 days + 1 second)
+        env.ledger()
+            .set_timestamp(base_time + validity_period + 7 * 86_400 + 1);
+
+        assert_eq!(
+            client.get_credential_status(&engineer),
+            CredentialStatus::HardExpired
+        );
+    }
+
+    #[test]
+    fn test_get_credential_status_revoked() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin) = setup(&env);
+
+        let engineer = Address::generate(&env);
+        let issuer = Address::generate(&env);
+        let hash = BytesN::from_array(&env, &[1u8; 32]);
+
+        client.add_trusted_issuer(&admin, &issuer);
+        client.register_engineer(&engineer, &hash, &issuer, &31_536_000);
+        client.revoke_credential(&engineer);
+
+        assert_eq!(
+            client.get_credential_status(&engineer),
+            CredentialStatus::Revoked
+        );
+    }
+
+    #[test]
+    fn test_get_credential_status_not_found() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _admin) = setup(&env);
+
+        let unknown = Address::generate(&env);
+        assert_eq!(
+            client.get_credential_status(&unknown),
+            CredentialStatus::NotFound
+        );
+    }
+
+    #[test]
+    fn test_grace_period_boundary_at_expiry_edge() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin) = setup(&env);
+
+        let engineer = Address::generate(&env);
+        let issuer = Address::generate(&env);
+        let hash = BytesN::from_array(&env, &[1u8; 32]);
+
+        client.add_trusted_issuer(&admin, &issuer);
+        let base_time = env.ledger().timestamp();
+        let validity = 1000;
+        client.register_engineer(&engineer, &hash, &issuer, &validity);
+
+        // Exactly at expiry time
+        env.ledger().set_timestamp(base_time + validity);
+        assert_eq!(
+            client.get_credential_status(&engineer),
+            CredentialStatus::GracePeriod
+        );
+
+        // One second before expiry
+        env.ledger().set_timestamp(base_time + validity - 1);
+        assert_eq!(
+            client.get_credential_status(&engineer),
+            CredentialStatus::Valid
+        );
+    }
+
+    #[test]
+    fn test_grace_period_boundary_at_grace_end() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin) = setup(&env);
+
+        let engineer = Address::generate(&env);
+        let issuer = Address::generate(&env);
+        let hash = BytesN::from_array(&env, &[1u8; 32]);
+
+        client.add_trusted_issuer(&admin, &issuer);
+        let base_time = env.ledger().timestamp();
+        let validity = 1000;
+        let grace_end = base_time + validity + 7 * 86_400;
+        
+        client.register_engineer(&engineer, &hash, &issuer, &validity);
+
+        // At the exact end of grace period boundary
+        env.ledger().set_timestamp(grace_end);
+        assert_eq!(
+            client.get_credential_status(&engineer),
+            CredentialStatus::HardExpired
+        );
+
+        // One second before grace end
+        env.ledger().set_timestamp(grace_end - 1);
+        assert_eq!(
+            client.get_credential_status(&engineer),
+            CredentialStatus::GracePeriod
+        );
+    }
+
+    #[test]
+    fn test_renew_credential_during_grace_period() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin) = setup(&env);
+
+        let engineer = Address::generate(&env);
+        let issuer = Address::generate(&env);
+        let hash = BytesN::from_array(&env, &[1u8; 32]);
+
+        client.add_trusted_issuer(&admin, &issuer);
+        let base_time = env.ledger().timestamp();
+        client.register_engineer(&engineer, &hash, &issuer, &1000);
+
+        // Advance into grace period
+        env.ledger().set_timestamp(base_time + 1001 + 100_000);
+        assert_eq!(
+            client.get_credential_status(&engineer),
+            CredentialStatus::GracePeriod
+        );
+
+        // Renew during grace period
+        client.renew_credential(&engineer, &86_400);
+
+        // After renewal, should be valid again
+        assert_eq!(
+            client.get_credential_status(&engineer),
+            CredentialStatus::Valid
+        );
+
+        let record = client.get_engineer(&engineer);
+        assert!(record.expires_at > env.ledger().timestamp());
     }
 }
