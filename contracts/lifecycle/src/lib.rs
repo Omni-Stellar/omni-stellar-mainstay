@@ -80,6 +80,14 @@ fn engineer_auth_key(asset_id: u64, engineer: &Address) -> (Symbol, u64, Address
     (symbol_short!("ENG_AUTH"), asset_id, engineer.clone())
 }
 
+fn frozen_key(asset_id: u64) -> (Symbol, u64) {
+    (symbol_short!("FROZEN"), asset_id)
+}
+
+fn frozen_score_key(asset_id: u64) -> (Symbol, u64) {
+    (symbol_short!("FRZ_SCR"), asset_id)
+}
+
 fn require_engineer_authorized(env: &Env, asset_id: u64, engineer: &Address) {
     let authorized: bool = env
         .storage()
@@ -123,11 +131,15 @@ fn engineer_history_add(env: &Env, engineer: &Address, asset_id: u64, max_histor
 
 fn engineer_history_remove(env: &Env, engineer: &Address, asset_id: u64) {
     let key = engineer_history_key(engineer);
-    if let Some(mut ids) = env.storage().persistent().get::<_, Vec<u64>>(&key) {
-        let initial_len = ids.len();
-        ids.retain(|id| id != &asset_id);
-        if ids.len() < initial_len {
-            env.storage().persistent().set(&key, &ids);
+    if let Some(ids) = env.storage().persistent().get::<_, Vec<u64>>(&key) {
+        let mut new_ids: Vec<u64> = Vec::new(env);
+        for id in ids.iter() {
+            if id != asset_id {
+                new_ids.push_back(id);
+            }
+        }
+        if new_ids.len() < ids.len() {
+            env.storage().persistent().set(&key, &new_ids);
             env.storage()
                 .persistent()
                 .extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
@@ -246,12 +258,13 @@ fn verify_asset_exists(env: &Env, asset_registry: &Address, asset_id: &u64) {
 
 // Minimal client interface for cross-contract call to EngineerRegistry
 mod engineer_registry {
-    use soroban_sdk::{contractclient, Address, Env};
+    use soroban_sdk::{contractclient, Address, Env, Vec};
 
     #[allow(dead_code)]
     #[contractclient(name = "EngineerRegistryClient")]
     pub trait EngineerRegistry {
-        fn verify_engineer(env: Env, engineer: Address) -> bool;
+        fn verify_engineer(env: Env, engineer: Address) -> Option<bool>;
+        fn batch_verify_engineers(env: Env, engineers: Vec<Address>) -> Vec<bool>;
     }
 }
 
@@ -902,7 +915,7 @@ impl Lifecycle {
         // Cross-check engineer credential via registry
         let registry_id = get_engineer_registry_addr(&env);
         let registry = engineer_registry::EngineerRegistryClient::new(&env, &registry_id);
-        let verified = registry.verify_engineer(&engineer);
+        let verified = registry.verify_engineer(&engineer).unwrap_or(false);
         if !verified {
             panic_with_error!(&env, ContractError::UnauthorizedEngineer);
         }
@@ -928,8 +941,17 @@ impl Lifecycle {
 
         engineer_history_add(&env, &engineer, asset_id, config.max_history);
 
-        // Calculate collateral score from all records weighted by recency
-        let new_score = compute_decay(&env, asset_id);
+        // Accumulate score: add this submission's increment to the stored score (cap at 100).
+        let current_score: u32 = env
+            .storage()
+            .persistent()
+            .get(&score_key(asset_id))
+            .unwrap_or(0);
+        let new_score = current_score.saturating_add(config.score_increment).min(100);
+
+        // Persist the accumulated score so apply_decay / get_collateral_score can read it.
+        env.storage().persistent().set(&score_key(asset_id), &new_score);
+        env.storage().persistent().extend_ttl(&score_key(asset_id), TTL_THRESHOLD, TTL_TARGET);
 
         // Append (timestamp, score) snapshot to score history for historical tracking
         score_history_push(
@@ -1084,11 +1106,14 @@ impl Lifecycle {
         let asset_registry = get_asset_registry_addr(&env);
         verify_asset_exists(&env, &asset_registry, &asset_id);
 
-        // Validate engineer credential via registry
+        // Validate engineer credential via batch call to reduce future round-trips.
         let engineer_registry = get_engineer_registry_addr(&env);
         let engineer_registry_client =
             engineer_registry::EngineerRegistryClient::new(&env, &engineer_registry);
-        let verified = engineer_registry_client.verify_engineer(&engineer);
+        let mut batch = Vec::new(&env);
+        batch.push_back(engineer.clone());
+        let results = engineer_registry_client.batch_verify_engineers(&batch);
+        let verified = results.get(0).unwrap_or(false);
         if !verified {
             panic_with_error!(&env, ContractError::UnauthorizedEngineer);
         }
@@ -1171,12 +1196,57 @@ impl Lifecycle {
     /// - [`ContractError::NotInitialized`] if contract has not been initialized
     pub fn decay_score(env: Env, asset_id: u64) -> u32 {
         ensure_not_paused(&env);
+        // Frozen (decommissioned) assets do not decay; return the frozen score.
+        if env.storage().persistent().get::<_, bool>(&frozen_key(asset_id)).unwrap_or(false) {
+            return env
+                .storage()
+                .persistent()
+                .get(&frozen_score_key(asset_id))
+                .unwrap_or(0);
+        }
         let config: Config = env
             .storage()
             .persistent()
             .get(&CONFIG)
             .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
         apply_decay(&env, asset_id, true, true, config.max_history)
+    }
+
+    /// Called by the asset registry when an asset is decommissioned.
+    /// Captures the current collateral score and freezes it so that lenders
+    /// see the final verified state rather than a decayed ghost score.
+    ///
+    /// Authorization: only callable by the stored asset registry address.
+    ///
+    /// # Arguments
+    /// * `asset_id` - The unique identifier of the decommissioned asset
+    ///
+    /// # Panics
+    /// - [`ContractError::NotInitialized`] if contract has not been initialized
+    pub fn decommission_notify(env: Env, asset_id: u64) {
+        let asset_registry = get_asset_registry_addr(&env);
+        asset_registry.require_auth();
+        env.storage()
+            .persistent()
+            .get::<_, Config>(&CONFIG)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
+
+        let frozen_score = compute_decay(&env, asset_id);
+        env.storage()
+            .persistent()
+            .set(&frozen_score_key(asset_id), &frozen_score);
+        env.storage()
+            .persistent()
+            .extend_ttl(&frozen_score_key(asset_id), TTL_THRESHOLD, TTL_TARGET);
+        env.storage()
+            .persistent()
+            .set(&frozen_key(asset_id), &true);
+        env.storage()
+            .persistent()
+            .extend_ttl(&frozen_key(asset_id), TTL_THRESHOLD, TTL_TARGET);
+
+        env.events()
+            .publish((symbol_short!("DECOMM"), asset_id), frozen_score);
     }
 
     /// Get the complete maintenance history for an asset.
@@ -1289,12 +1359,44 @@ impl Lifecycle {
     pub fn get_collateral_score(env: Env, asset_id: u64) -> u32 {
         let asset_registry = get_asset_registry_addr(&env);
         verify_asset_exists(&env, &asset_registry, &asset_id);
-        // Ensure CONFIG is present (NotInitialized guard)
-        env.storage()
+        let config: Config = env
+            .storage()
             .persistent()
             .get::<_, Config>(&CONFIG)
             .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
-        let score = compute_decay(&env, asset_id);
+        // Frozen (decommissioned) assets return the score captured at decommission time.
+        if env.storage().persistent().get::<_, bool>(&frozen_key(asset_id)).unwrap_or(false) {
+            return env
+                .storage()
+                .persistent()
+                .get(&frozen_score_key(asset_id))
+                .unwrap_or(0);
+        }
+        // Compute score from maintenance history (recency-weighted, decreases as records age).
+        let history_score = compute_decay(&env, asset_id);
+
+        // Compute score from accumulated stored value with lazy config-based decay applied.
+        // This is read-only — does NOT write back to storage.
+        let config_score = {
+            let stored: u32 = env
+                .storage()
+                .persistent()
+                .get(&score_key(asset_id))
+                .unwrap_or(0);
+            let last_update: u64 = env
+                .storage()
+                .persistent()
+                .get(&last_update_key(asset_id))
+                .unwrap_or(0);
+            let elapsed = env.ledger().timestamp().saturating_sub(last_update);
+            let intervals = elapsed / config.decay_interval;
+            let decay = (intervals as u32).saturating_mul(config.decay_rate);
+            stored.saturating_sub(decay)
+        };
+
+        // Use the lower of the two scores so both models can constrain the result.
+        let score = history_score.min(config_score);
+
         // Apply floor: an asset with at least one maintenance record always scores >= 1
         // so it is never indistinguishable from an asset with no history.
         let has_history = env
@@ -1736,6 +1838,10 @@ impl Lifecycle {
         }
 
         let now = env.ledger().timestamp();
+        // Clear the maintenance history so compute_decay returns 0 after reset.
+        let empty_history: Vec<MaintenanceRecord> = Vec::new(&env);
+        env.storage().persistent().set(&history_key(asset_id), &empty_history);
+        env.storage().persistent().extend_ttl(&history_key(asset_id), TTL_THRESHOLD, TTL_TARGET);
         env.storage().persistent().set(&score_key(asset_id), &0u32);
         env.storage()
             .persistent()
@@ -2018,21 +2124,37 @@ mod tests {
 
     /// Generate a unique serial number string for each test asset registration.
     fn unique_serial(env: &Env) -> String {
-        use std::sync::atomic::{AtomicU64, Ordering};
+        use core::sync::atomic::{AtomicU64, Ordering};
         static COUNTER: AtomicU64 = AtomicU64::new(1);
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        String::from_str(env, &std::format!("SN-{n}"))
+        // Build "SN-<n>" without std::format! (crate is no_std)
+        let mut buf = [0u8; 24];
+        buf[0] = b'S'; buf[1] = b'N'; buf[2] = b'-';
+        let mut end = 24usize;
+        let mut v = if n == 0 { 1u64 } else { n };
+        while v > 0 {
+            end -= 1;
+            buf[end] = b'0' + (v % 10) as u8;
+            v /= 10;
+        }
+        let digit_len = 24 - end;
+        let mut out = [0u8; 24];
+        out[0] = b'S'; out[1] = b'N'; out[2] = b'-';
+        out[3..3 + digit_len].copy_from_slice(&buf[end..24]);
+        let s = core::str::from_utf8(&out[..3 + digit_len]).unwrap_or("SN-1");
+        String::from_str(env, s)
     }
 
-    fn register_asset(env: &Env, registry_client: &AssetRegistryClient) -> u64 {
+    fn register_asset(env: &Env, registry_client: &AssetRegistryClient) -> (u64, Address) {
         let owner = Address::generate(env);
         let serial = unique_serial(env);
-        registry_client.register_asset(
+        let asset_id = registry_client.register_asset(
             &symbol_short!("GENSET"),
             &String::from_str(env, "Caterpillar 3516"),
             &serial,
             &owner,
-        )
+        );
+        (asset_id, owner)
     }
 
     fn register_asset_for_owner(
@@ -2066,8 +2188,9 @@ mod tests {
         env.mock_all_auths();
 
         let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
-        let asset_id = register_asset(&env, &asset_registry_client);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
         let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
 
         // 10 maintenance events at default score_increment (5) each = 50 points
         for _ in 0..10 {
@@ -2162,8 +2285,9 @@ mod tests {
         env.mock_all_auths();
 
         let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
-        let asset_id = register_asset(&env, &asset_registry_client);
+        let (asset_id, _asset_owner) = register_asset(&env, &asset_registry_client);
         let engineer = register_engineer(&env, &engineer_registry_client);
+        // Intentionally NOT authorizing the engineer so the submission fails
 
         let result = client.try_submit_maintenance(
             &asset_id,
@@ -2243,8 +2367,9 @@ mod tests {
         env.mock_all_auths();
 
         let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 3);
-        let asset_id = register_asset(&env, &asset_registry_client);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
         let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
 
         for _ in 0..3 {
             client.submit_maintenance(
@@ -2277,8 +2402,9 @@ mod tests {
         env.mock_all_auths();
 
         let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 3);
-        let asset_id = register_asset(&env, &asset_registry_client);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
         let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
 
         for _ in 0..3 {
             client.submit_maintenance(
@@ -2312,8 +2438,9 @@ mod tests {
         env.mock_all_auths();
 
         let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
-        let asset_id = register_asset(&env, &asset_registry_client);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
         let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
 
         let result = client.try_submit_maintenance(
             &asset_id,
@@ -2336,8 +2463,9 @@ mod tests {
         env.mock_all_auths();
 
         let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
-        let asset_id = register_asset(&env, &asset_registry_client);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
         let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
 
         let result = client.try_submit_maintenance(
             &asset_id,
@@ -2360,8 +2488,9 @@ mod tests {
         env.mock_all_auths();
 
         let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
-        let asset_id = register_asset(&env, &asset_registry_client);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
         let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
 
         let oversized_notes = String::from_str(&env, &"x".repeat(300));
 
@@ -2386,7 +2515,7 @@ mod tests {
         env.mock_all_auths();
 
         let (client, asset_registry_client, _, _) = setup(&env, 0);
-        let asset_id = register_asset(&env, &asset_registry_client);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
         let unregistered = Address::generate(&env);
 
         let result = client.try_submit_maintenance(
@@ -2409,9 +2538,11 @@ mod tests {
         env.mock_all_auths();
 
         let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
-        let asset_id1 = register_asset(&env, &asset_registry_client);
-        let asset_id2 = register_asset(&env, &asset_registry_client);
+        let (asset_id1, asset_owner1) = register_asset(&env, &asset_registry_client);
+        let (asset_id2, asset_owner2) = register_asset(&env, &asset_registry_client);
         let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner1, &asset_id1, &engineer);
+        client.authorize_engineer(&asset_owner2, &asset_id2, &engineer);
 
         client.submit_maintenance(
             &asset_id1,
@@ -2446,7 +2577,7 @@ mod tests {
         // Register and maintain 5 different assets (exceeds max_history=3)
         let mut asset_ids = Vec::new(&env);
         for _ in 0..5 {
-            let asset_id = register_asset(&env, &asset_registry_client);
+            let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
             asset_ids.push_back(asset_id);
             client.submit_maintenance(
                 &asset_id,
@@ -2480,8 +2611,9 @@ mod tests {
         env.mock_all_auths();
 
         let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
-        let asset_id = register_asset(&env, &asset_registry_client);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
         let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
 
         client.submit_maintenance(
             &asset_id,
@@ -2507,7 +2639,7 @@ mod tests {
         env.mock_all_auths();
 
         let (client, asset_registry_client, _, _) = setup(&env, 0);
-        let asset_id = register_asset(&env, &asset_registry_client);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
         assert_eq!(client.get_last_service(&asset_id), None);
     }
 
@@ -2526,8 +2658,9 @@ mod tests {
         env.mock_all_auths();
 
         let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
-        let asset_id = register_asset(&env, &asset_registry_client);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
         let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
 
         // Submit first record at t=1000
         env.ledger().set_timestamp(1000);
@@ -2558,8 +2691,9 @@ mod tests {
         env.mock_all_auths();
 
         let (client, asset_registry_client, engineer_registry_client, admin) = setup(&env, 0);
-        let asset_id = register_asset(&env, &asset_registry_client);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
         let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
 
         client.update_score_increment(&admin, &12);
         client.submit_maintenance(
@@ -2579,8 +2713,9 @@ mod tests {
         env.mock_all_auths();
 
         let (client, asset_registry_client, engineer_registry_client, admin) = setup(&env, 0);
-        let asset_id = register_asset(&env, &asset_registry_client);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
         let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
 
         // Default score_increment is 5
         client.submit_maintenance(
@@ -2718,8 +2853,9 @@ mod tests {
 
         // Setup with initial max_history of 10
         let (client, asset_registry_client, engineer_registry_client, admin) = setup(&env, 10);
-        let asset_id = register_asset(&env, &asset_registry_client);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
         let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
 
         // Submit 4 maintenance records (below max_history of 10)
         for _i in 0..4 {
@@ -2767,8 +2903,9 @@ mod tests {
 
         // Setup with initial max_history of 10
         let (client, asset_registry_client, engineer_registry_client, admin) = setup(&env, 10);
-        let asset_id = register_asset(&env, &asset_registry_client);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
         let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
 
         // Submit 10 maintenance records to reach max_history
         for _i in 0..10 {
@@ -2811,8 +2948,9 @@ mod tests {
 
         // Setup with initial max_history of 10
         let (client, asset_registry_client, engineer_registry_client, admin) = setup(&env, 10);
-        let asset_id = register_asset(&env, &asset_registry_client);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
         let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
 
         // Submit 10 maintenance records to reach max_history
         for _i in 0..10 {
@@ -2863,7 +3001,7 @@ mod tests {
         env.mock_all_auths();
 
         let (client, asset_registry_client, _, _) = setup(&env, 10);
-        let asset_id = register_asset(&env, &asset_registry_client);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
         let outsider = Address::generate(&env);
 
         let result = client.try_prune_asset_history(&outsider, &asset_id);
@@ -2881,8 +3019,9 @@ mod tests {
         env.mock_all_auths();
 
         let (client, asset_registry_client, engineer_registry_client, admin) = setup(&env, 0);
-        let asset_id = register_asset(&env, &asset_registry_client);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
         let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
 
         // Build up a score first (default score_increment = 5)
         client.submit_maintenance(
@@ -2973,8 +3112,9 @@ mod tests {
         env.mock_all_auths();
 
         let (client, asset_registry_client, engineer_registry_client, admin) = setup(&env, 0);
-        let asset_id = register_asset(&env, &asset_registry_client);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
         let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
 
         // Build up a score to 25 (5 * default score_increment of 5)
         for _ in 0..5 {
@@ -3008,8 +3148,9 @@ mod tests {
         env.mock_all_auths();
 
         let (client, asset_registry_client, engineer_registry_client, admin) = setup(&env, 0);
-        let asset_id = register_asset(&env, &asset_registry_client);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
         let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
 
         // Build score to 20 (default score_increment = 5)
         for _ in 0..4 {
@@ -3045,8 +3186,9 @@ mod tests {
         env.mock_all_auths();
 
         let (client, asset_registry_client, engineer_registry_client, admin) = setup(&env, 0);
-        let asset_id = register_asset(&env, &asset_registry_client);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
         let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
 
         // Build score to 20 (4 × default score_increment of 5)
         for _ in 0..4 {
@@ -3094,8 +3236,9 @@ mod tests {
         env.mock_all_auths();
 
         let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
-        let asset_id = register_asset(&env, &asset_registry_client);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
         let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
 
         for _ in 0..10 {
             client.submit_maintenance(
@@ -3121,8 +3264,9 @@ mod tests {
         env.mock_all_auths();
 
         let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
-        let asset_id = register_asset(&env, &asset_registry_client);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
         let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
 
         client.submit_maintenance(
             &asset_id,
@@ -3153,6 +3297,7 @@ mod tests {
         let asset_id = asset_registry_client.register_asset(
             &symbol_short!("GENSET"),
             &String::from_str(&env, "No-maintenance asset"),
+            &unique_serial(&env),
             &owner,
         );
 
@@ -3180,14 +3325,15 @@ mod tests {
         env.mock_all_auths();
 
         let (client, asset_registry_client, engineer_registry_client, admin) = setup(&env, 0);
-        let asset_id = register_asset(&env, &asset_registry_client);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
         let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
 
         // Build a score then reset it to 0 so last_update_key exists but score is 0
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("OIL_CHG"),
-            &String::from_str(&env, ""),
+            &String::from_str(&env, "ok"),
             &engineer,
         );
         client.reset_score(&admin, &asset_id);
@@ -3214,14 +3360,15 @@ mod tests {
         env.mock_all_auths();
 
         let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
-        let asset_id = register_asset(&env, &asset_registry_client);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
         let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
 
         // Build a non-zero score
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("OIL_CHG"),
-            &String::from_str(&env, ""),
+            &String::from_str(&env, "ok"),
             &engineer,
         );
         let initial_score = client.get_collateral_score(&asset_id);
@@ -3261,8 +3408,9 @@ mod tests {
         env.mock_all_auths();
 
         let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
-        let asset_id = register_asset(&env, &asset_registry_client);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
         let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
 
         let task_type = symbol_short!("OIL_CHG");
         let timestamp = env.ledger().timestamp();
@@ -3418,8 +3566,9 @@ mod tests {
         env.mock_all_auths();
 
         let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
-        let asset_id = register_asset(&env, &asset_registry_client);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
         let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
 
         // One maintenance record gives a low score (well below default threshold of 50)
         client.submit_maintenance(
@@ -3438,8 +3587,9 @@ mod tests {
         env.mock_all_auths();
 
         let (client, asset_registry_client, engineer_registry_client, admin) = setup(&env, 0);
-        let asset_id = register_asset(&env, &asset_registry_client);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
         let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
 
         client.submit_maintenance(
             &asset_id,
@@ -3461,8 +3611,9 @@ mod tests {
         env.mock_all_auths();
 
         let (client, asset_registry_client, engineer_registry_client, admin) = setup(&env, 0);
-        let asset_id = register_asset(&env, &asset_registry_client);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
         let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
 
         // Build score to exactly the eligibility threshold (50) via 10 ÃƒÆ’Ã¢â‚¬â€ FILTER (5 pts each)
         for _ in 0..10 {
@@ -3489,8 +3640,9 @@ mod tests {
         env.mock_all_auths();
 
         let (client, asset_registry_client, engineer_registry_client, admin) = setup(&env, 0);
-        let asset_id = register_asset(&env, &asset_registry_client);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
         let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
 
         // Set eligibility threshold to a deterministic value for boundary testing.
         client.update_eligibility_threshold(&admin, &10);
@@ -3558,22 +3710,22 @@ mod tests {
         let engineer = register_engineer(&env, &engineer_registry_client);
 
         // asset_a: 10 ÃƒÆ’Ã¢â‚¬â€ ENGINE (5 pts each) = 50 ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ eligible
-        let asset_a = register_asset(&env, &asset_registry_client);
+        let (asset_a, asset_owner_a) = register_asset(&env, &asset_registry_client);
         for _ in 0..10 {
             client.submit_maintenance(
                 &asset_a,
                 &symbol_short!("ENGINE"),
-                &String::from_str(&env, ""),
+                &String::from_str(&env, "ok"),
                 &engineer,
             );
         }
 
         // asset_b: 1 ÃƒÆ’Ã¢â‚¬â€ OIL_CHG (5 pts) ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ not eligible
-        let asset_b = register_asset(&env, &asset_registry_client);
+        let (asset_b, asset_owner_b) = register_asset(&env, &asset_registry_client);
         client.submit_maintenance(
             &asset_b,
             &symbol_short!("OIL_CHG"),
-            &String::from_str(&env, ""),
+            &String::from_str(&env, "ok"),
             &engineer,
         );
 
@@ -3625,21 +3777,21 @@ mod tests {
         let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
         let engineer = register_engineer(&env, &engineer_registry_client);
 
-        let asset_a = register_asset(&env, &asset_registry_client);
-        let asset_b = register_asset(&env, &asset_registry_client);
+        let (asset_a, asset_owner_a) = register_asset(&env, &asset_registry_client);
+        let (asset_b, asset_owner_b) = register_asset(&env, &asset_registry_client);
 
         // Give both assets a score above the default threshold (50)
         for _ in 0..10 {
             client.submit_maintenance(
                 &asset_a,
                 &symbol_short!("ENGINE"),
-                &String::from_str(&env, ""),
+                &String::from_str(&env, "ok"),
                 &engineer,
             );
             client.submit_maintenance(
                 &asset_b,
                 &symbol_short!("ENGINE"),
-                &String::from_str(&env, ""),
+                &String::from_str(&env, "ok"),
                 &engineer,
             );
         }
@@ -3699,12 +3851,12 @@ mod tests {
 
         let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
         let engineer = register_engineer(&env, &engineer_registry_client);
-        let asset_id = register_asset(&env, &asset_registry_client);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
 
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("ENGINE"),
-            &String::from_str(&env, ""),
+            &String::from_str(&env, "ok"),
             &engineer,
         );
 
@@ -3726,21 +3878,23 @@ mod tests {
         let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
         let engineer = register_engineer(&env, &engineer_registry_client);
 
-        let asset_a = register_asset(&env, &asset_registry_client);
-        let asset_b = register_asset(&env, &asset_registry_client);
+        let (asset_a, asset_owner_a) = register_asset(&env, &asset_registry_client);
+        let (asset_b, asset_owner_b) = register_asset(&env, &asset_registry_client);
+        client.authorize_engineer(&asset_owner_a, &asset_a, &engineer);
+        client.authorize_engineer(&asset_owner_b, &asset_b, &engineer);
 
         for _ in 0..10 {
             client.submit_maintenance(
                 &asset_a,
                 &symbol_short!("ENGINE"),
-                &String::from_str(&env, ""),
+                &String::from_str(&env, "ok"),
                 &engineer,
             );
         }
         client.submit_maintenance(
             &asset_b,
             &symbol_short!("OIL_CHG"),
-            &String::from_str(&env, ""),
+            &String::from_str(&env, "ok"),
             &engineer,
         );
 
@@ -3921,7 +4075,7 @@ mod tests {
         env.mock_all_auths();
 
         let (client, asset_registry_client, _, _) = setup(&env, 0);
-        let asset_id = register_asset(&env, &asset_registry_client);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
 
         let history = client.get_score_history(&asset_id);
         assert_eq!(history.len(), 0);
@@ -3933,8 +4087,9 @@ mod tests {
         env.mock_all_auths();
 
         let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
-        let asset_id = register_asset(&env, &asset_registry_client);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
         let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
 
         client.submit_maintenance(
             &asset_id,
@@ -3966,8 +4121,9 @@ mod tests {
         env.mock_all_auths();
 
         let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
-        let asset_id = register_asset(&env, &asset_registry_client);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
         let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
 
         // All tasks use score_increment (default 5)
         client.submit_maintenance(
@@ -4001,8 +4157,9 @@ mod tests {
         env.mock_all_auths();
 
         let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
-        let asset_id = register_asset(&env, &asset_registry_client);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
         let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
 
         let t0 = env.ledger().timestamp();
         client.submit_maintenance(
@@ -4033,8 +4190,9 @@ mod tests {
         env.mock_all_auths();
 
         let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
-        let asset_id = register_asset(&env, &asset_registry_client);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
         let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
 
         // 20 tasks at default score_increment (5) each would be 100, then more should stay at 100
         for _ in 0..22 {
@@ -4063,15 +4221,16 @@ mod tests {
 
         // max_history = 5
         let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 5);
-        let asset_id = register_asset(&env, &asset_registry_client);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
         let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
 
         // Submit 8 records ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â history_key is capped at 5, score_history must also stay at 5
         for _ in 0..5 {
             client.submit_maintenance(
                 &asset_id,
                 &symbol_short!("OIL_CHG"),
-                &String::from_str(&env, ""),
+                &String::from_str(&env, "ok"),
                 &engineer,
             );
         }
@@ -4096,8 +4255,9 @@ mod tests {
         env.mock_all_auths();
 
         let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
-        let asset_id = register_asset(&env, &asset_registry_client);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
         let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
 
         for _ in 0..5 {
             client.submit_maintenance(
@@ -4123,8 +4283,9 @@ mod tests {
         env.mock_all_auths();
 
         let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
-        let asset_id = register_asset(&env, &asset_registry_client);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
         let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
 
         client.submit_maintenance(
             &asset_id,
@@ -4144,8 +4305,9 @@ mod tests {
         env.mock_all_auths();
 
         let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
-        let asset_id = register_asset(&env, &asset_registry_client);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
         let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
 
         client.submit_maintenance(
             &asset_id,
@@ -4164,7 +4326,7 @@ mod tests {
         env.mock_all_auths();
 
         let (client, asset_registry_client, _, _) = setup(&env, 0);
-        let asset_id = register_asset(&env, &asset_registry_client);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
 
         let trend = client.get_score_trend(&asset_id, &5);
         assert_eq!(trend.len(), 0);
@@ -4176,8 +4338,9 @@ mod tests {
         env.mock_all_auths();
 
         let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
-        let asset_id = register_asset(&env, &asset_registry_client);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
         let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
 
         let mut records = Vec::new(&env);
         records.push_back(BatchRecord {
@@ -4206,8 +4369,9 @@ mod tests {
         env.mock_all_auths();
 
         let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
-        let asset_id = register_asset(&env, &asset_registry_client);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
         let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
 
         let mut records = Vec::new(&env);
         records.push_back(BatchRecord {
@@ -4239,8 +4403,9 @@ mod tests {
         env.mock_all_auths();
 
         let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
-        let asset_id = register_asset(&env, &asset_registry_client);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
         let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
 
         let mut records = Vec::new(&env);
         records.push_back(BatchRecord {
@@ -4264,8 +4429,9 @@ mod tests {
         env.mock_all_auths();
 
         let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
-        let asset_id = register_asset(&env, &asset_registry_client);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
         let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
 
         // Submit multiple records for the same asset in one batch
         let mut records = Vec::new(&env);
@@ -4296,15 +4462,16 @@ mod tests {
         env.mock_all_auths();
 
         let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 3);
-        let asset_id = register_asset(&env, &asset_registry_client);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
         let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
 
         // Fill to max_history - 1 = 2
         for _ in 0..2 {
             client.submit_maintenance(
                 &asset_id,
                 &symbol_short!("OIL_CHG"),
-                &String::from_str(&env, ""),
+                &String::from_str(&env, "ok"),
                 &engineer,
             );
         }
@@ -4314,11 +4481,11 @@ mod tests {
         let mut records = Vec::new(&env);
         records.push_back(BatchRecord {
             task_type: symbol_short!("OIL_CHG"),
-            notes: String::from_str(&env, ""),
+            notes: String::from_str(&env, "ok"),
         });
         records.push_back(BatchRecord {
             task_type: symbol_short!("OIL_CHG"),
-            notes: String::from_str(&env, ""),
+            notes: String::from_str(&env, "ok"),
         });
 
         let result = client.try_batch_submit_maintenance(&asset_id, &records, &engineer);
@@ -4339,8 +4506,9 @@ mod tests {
         env.mock_all_auths();
 
         let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 2);
-        let asset_id = register_asset(&env, &asset_registry_client);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
         let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
 
         let mut records = Vec::new(&env);
         records.push_back(BatchRecord {
@@ -4371,7 +4539,7 @@ mod tests {
         env.mock_all_auths();
 
         let (client, asset_registry_client, _, _) = setup(&env, 0);
-        let asset_id = register_asset(&env, &asset_registry_client);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
         let unregistered = Address::generate(&env);
 
         let mut records = Vec::new(&env);
@@ -4395,8 +4563,9 @@ mod tests {
         env.mock_all_auths();
 
         let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
-        let asset_id = register_asset(&env, &asset_registry_client);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
         let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
 
         let mut records = Vec::new(&env);
         records.push_back(BatchRecord {
@@ -4429,8 +4598,9 @@ mod tests {
         env.mock_all_auths();
 
         let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
-        let asset_id = register_asset(&env, &asset_registry_client);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
         let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
 
         let mut records = Vec::new(&env);
         records.push_back(BatchRecord {
@@ -4454,7 +4624,7 @@ mod tests {
         env.mock_all_auths();
 
         let (client, asset_registry_client, _, _) = setup(&env, 0);
-        let asset_id = register_asset(&env, &asset_registry_client);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
         let unregistered = Address::generate(&env);
 
         let result = client.try_submit_maintenance(
@@ -4477,8 +4647,9 @@ mod tests {
         env.mock_all_auths();
 
         let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
-        let asset_id = register_asset(&env, &asset_registry_client);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
         let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
 
         // FILTER = 5 points each; 25 submissions would be 125 without a cap
         for _ in 0..25 {
@@ -4499,8 +4670,9 @@ mod tests {
         env.mock_all_auths();
 
         let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
-        let asset_id = register_asset(&env, &asset_registry_client);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
         let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
 
         engineer_registry_client.revoke_credential(&engineer);
 
@@ -4524,12 +4696,13 @@ mod tests {
         env.mock_all_auths();
 
         let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
-        let asset_id = register_asset(&env, &asset_registry_client);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
         let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
 
-        assert!(engineer_registry_client.verify_engineer(&engineer));
+        assert!(engineer_registry_client.verify_engineer(&engineer).unwrap_or(false));
         engineer_registry_client.revoke_credential(&engineer);
-        assert!(!engineer_registry_client.verify_engineer(&engineer));
+        assert!(!engineer_registry_client.verify_engineer(&engineer).unwrap_or(true));
 
         let result = client.try_submit_maintenance(
             &asset_id,
@@ -4552,7 +4725,7 @@ mod tests {
         env.mock_all_auths();
 
         let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
-        let asset_id = register_asset(&env, &asset_registry_client);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
 
         // Set up a trusted issuer and register the engineer
         let engineer = Address::generate(&env);
@@ -4563,6 +4736,7 @@ mod tests {
         engineer_registry_client.initialize_admin(&admin, &admin);
         engineer_registry_client.add_trusted_issuer(&admin, &issuer);
         engineer_registry_client.register_engineer(&engineer, &hash_v1, &issuer, &31_536_000);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
 
         // Revoke the credential
         engineer_registry_client.revoke_credential(&engineer);
@@ -4606,23 +4780,23 @@ mod tests {
         env.mock_all_auths();
 
         let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
-        let asset_id = register_asset(&env, &asset_registry_client);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
 
-        // Register engineer with short validity period (1000 seconds)
+        // Register engineer with minimum validity period (86400 seconds)
         let engineer = Address::generate(&env);
         let issuer = Address::generate(&env);
         let admin = Address::generate(&env);
         let hash = BytesN::from_array(&env, &[1u8; 32]);
         engineer_registry_client.initialize_admin(&admin, &admin);
         engineer_registry_client.add_trusted_issuer(&admin, &issuer);
-        engineer_registry_client.register_engineer(&engineer, &hash, &issuer, &1000);
+        engineer_registry_client.register_engineer(&engineer, &hash, &issuer, &86_400);
 
         // Verify engineer is initially valid
         assert_eq!(engineer_registry_client.verify_engineer(&engineer), Some(true));
 
-        // Advance ledger past expiry (1001 seconds)
+        // Advance ledger past expiry (86401 seconds)
         env.ledger()
-            .with_mut(|li| li.timestamp = li.timestamp + 1001);
+            .with_mut(|li| li.timestamp = li.timestamp + 86_401);
 
         // Verify engineer is now expired
         assert_eq!(engineer_registry_client.verify_engineer(&engineer), Some(false));
@@ -4654,6 +4828,7 @@ mod tests {
         let asset_id = asset_registry_client.register_asset(
             &symbol_short!("GENSET"),
             &String::from_str(&env, "Test Generator"),
+            &unique_serial(&env),
             &owner,
         );
 
@@ -4663,13 +4838,13 @@ mod tests {
         let hash = BytesN::from_array(&env, &[1u8; 32]);
         engineer_registry_client.initialize_admin(&eng_admin, &eng_admin);
         engineer_registry_client.add_trusted_issuer(&eng_admin, &issuer);
-        // Register with validity_period = 100 seconds
-        engineer_registry_client.register_engineer(&engineer, &hash, &issuer, &100);
+        // Register with validity_period = 86400 seconds (minimum)
+        engineer_registry_client.register_engineer(&engineer, &hash, &issuer, &86_400);
 
         assert_eq!(engineer_registry_client.verify_engineer(&engineer), Some(true));
 
         // Advance ledger by 101 seconds ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â credential is now expired
-        env.ledger().with_mut(|li| li.timestamp += 101);
+        env.ledger().with_mut(|li| li.timestamp += 86_401);
 
         assert_eq!(engineer_registry_client.verify_engineer(&engineer), Some(false));
 
@@ -4699,6 +4874,7 @@ mod tests {
         let asset_id = asset_registry_client.register_asset(
             &symbol_short!("GENSET"),
             &String::from_str(&env, "Test Generator"),
+            &unique_serial(&env),
             &owner,
         );
 
@@ -4708,13 +4884,13 @@ mod tests {
         let hash = BytesN::from_array(&env, &[1u8; 32]);
         engineer_registry_client.initialize_admin(&eng_admin, &eng_admin);
         engineer_registry_client.add_trusted_issuer(&eng_admin, &issuer);
-        // Register with validity_period = 100 seconds
-        engineer_registry_client.register_engineer(&engineer, &hash, &issuer, &100);
+        // Register with validity_period = 86400 seconds (minimum)
+        engineer_registry_client.register_engineer(&engineer, &hash, &issuer, &86_400);
 
         assert_eq!(engineer_registry_client.verify_engineer(&engineer), Some(true));
 
         // Advance ledger by 101 seconds ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â credential is now expired
-        env.ledger().with_mut(|li| li.timestamp += 101);
+        env.ledger().with_mut(|li| li.timestamp += 86_401);
 
         assert_eq!(engineer_registry_client.verify_engineer(&engineer), Some(false));
 
@@ -4747,6 +4923,7 @@ mod tests {
         let asset_id = asset_registry.register_asset(
             &symbol_short!("TURBINE"),
             &String::from_str(&env, "GE LM2500 Turbine Unit 7"),
+            &unique_serial(&env),
             &owner,
         );
         let asset = asset_registry.get_asset(&asset_id);
@@ -4795,14 +4972,15 @@ mod tests {
         env.mock_all_auths();
 
         let (client, asset_registry_client, engineer_registry_client, admin) = setup(&env, 0);
-        let asset_id = register_asset(&env, &asset_registry_client);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
         let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
 
         // Default score_increment = 5
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("ENGINE"),
-            &String::from_str(&env, ""),
+            &String::from_str(&env, "ok"),
             &engineer,
         );
         let initial_score: u32 = 5;
@@ -4839,8 +5017,9 @@ mod tests {
         env.mock_all_auths();
 
         let (client, asset_registry_client, engineer_registry_client, admin) = setup(&env, 0);
-        let asset_id = register_asset(&env, &asset_registry_client);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
         let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
 
         // Build up a non-zero score
         client.submit_maintenance(
@@ -4862,8 +5041,9 @@ mod tests {
         env.mock_all_auths();
 
         let (client, asset_registry_client, engineer_registry_client, admin) = setup(&env, 0);
-        let asset_id = register_asset(&env, &asset_registry_client);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
         let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
 
         client.submit_maintenance(
             &asset_id,
@@ -4888,8 +5068,9 @@ mod tests {
         env.mock_all_auths();
 
         let (client, asset_registry_client, engineer_registry_client, admin) = setup(&env, 0);
-        let asset_id = register_asset(&env, &asset_registry_client);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
         let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
 
         // Build up a score, then reset
         client.submit_maintenance(
@@ -4928,14 +5109,15 @@ mod tests {
         env.mock_all_auths();
 
         let (client, asset_registry_client, engineer_registry_client, admin) = setup(&env, 0);
-        let asset_id = register_asset(&env, &asset_registry_client);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
         let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
 
         // Minor: OIL_CHG — score increments by score_increment (default 5)
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("OIL_CHG"),
-            &String::from_str(&env, ""),
+            &String::from_str(&env, "ok"),
             &engineer,
         );
         assert_eq!(client.get_collateral_score(&asset_id), 5);
@@ -4946,7 +5128,7 @@ mod tests {
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("FILTER"),
-            &String::from_str(&env, ""),
+            &String::from_str(&env, "ok"),
             &engineer,
         );
         assert_eq!(client.get_collateral_score(&asset_id), 5);
@@ -4957,7 +5139,7 @@ mod tests {
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("ENGINE"),
-            &String::from_str(&env, ""),
+            &String::from_str(&env, "ok"),
             &engineer,
         );
         assert_eq!(client.get_collateral_score(&asset_id), 5);
@@ -4967,7 +5149,7 @@ mod tests {
         let result = client.try_submit_maintenance(
             &asset_id,
             &symbol_short!("UNKNOWN"),
-            &String::from_str(&env, ""),
+            &String::from_str(&env, "ok"),
             &engineer,
         );
         assert_eq!(
@@ -4984,8 +5166,9 @@ mod tests {
         env.mock_all_auths();
 
         let (client, asset_registry_client, engineer_registry_client, admin) = setup(&env, 0);
-        let asset_id = register_asset(&env, &asset_registry_client);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
         let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
 
         // Build up a non-zero score
         client.submit_maintenance(
@@ -5019,8 +5202,9 @@ mod tests {
         env.mock_all_auths();
 
         let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
-        let asset_id = register_asset(&env, &asset_registry_client);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
         let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
 
         client.submit_maintenance(
             &asset_id,
@@ -5047,7 +5231,7 @@ mod tests {
         env.mock_all_auths();
 
         let (client, asset_registry_client, _, _) = setup(&env, 0);
-        let asset_id = register_asset(&env, &asset_registry_client);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
 
         assert_eq!(client.get_last_service_timestamp(&asset_id), None);
     }
@@ -5058,8 +5242,9 @@ mod tests {
         env.mock_all_auths();
 
         let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
-        let asset_id = register_asset(&env, &asset_registry_client);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
         let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
 
         let t0 = env.ledger().timestamp();
         client.submit_maintenance(
@@ -5135,7 +5320,7 @@ mod tests {
 
         // Register and maintain 150 assets
         for _ in 0..150 {
-            let asset_id = register_asset(&env, &asset_registry_client);
+            let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
             client.submit_maintenance(
                 &asset_id,
                 &symbol_short!("OIL_CHG"),
@@ -5157,7 +5342,8 @@ mod tests {
         let engineer = register_engineer(&env, &engineer_registry_client);
 
         for _ in 0..101 {
-            let asset_id = register_asset(&env, &asset_registry_client);
+            let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
+            client.authorize_engineer(&asset_owner, &asset_id, &engineer);
             client.submit_maintenance(
                 &asset_id,
                 &symbol_short!("OIL_CHG"),
@@ -5184,7 +5370,8 @@ mod tests {
 
         // Register and maintain 50 assets
         for _ in 0..50 {
-            let asset_id = register_asset(&env, &asset_registry_client);
+            let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
+            client.authorize_engineer(&asset_owner, &asset_id, &engineer);
             client.submit_maintenance(
                 &asset_id,
                 &symbol_short!("OIL_CHG"),
@@ -5482,8 +5669,9 @@ mod tests {
         env.mock_all_auths();
 
         let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
-        let asset_id = register_asset(&env, &asset_registry_client);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
         let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
 
         let mut records = Vec::new(&env);
         records.push_back(BatchRecord {
@@ -5515,8 +5703,9 @@ mod tests {
         env.mock_all_auths();
 
         let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
-        let asset_id = register_asset(&env, &asset_registry_client);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
         let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
 
         let mut records = Vec::new(&env);
         records.push_back(BatchRecord {
@@ -5550,8 +5739,9 @@ mod tests {
         env.mock_all_auths();
 
         let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
-        let asset_id = register_asset(&env, &asset_registry_client);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
         let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
 
         for _ in 0..5 {
             client.submit_maintenance(
@@ -5597,8 +5787,9 @@ mod tests {
         env.mock_all_auths();
 
         let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
-        let asset_id = register_asset(&env, &asset_registry_client);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
         let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
 
         for _ in 0..3 {
             client.submit_maintenance(
@@ -5643,7 +5834,7 @@ mod tests {
 
         // Submit maintenance on 5 different assets
         for _ in 0..5 {
-            let asset_id = register_asset(&env, &asset_registry_client);
+            let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
             client.submit_maintenance(
                 &asset_id,
                 &symbol_short!("OIL_CHG"),
@@ -5672,8 +5863,9 @@ mod tests {
         env.mock_all_auths();
 
         let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
-        let asset_id = register_asset(&env, &asset_registry_client);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
         let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
 
         client.submit_maintenance(
             &asset_id,
@@ -5714,8 +5906,9 @@ mod tests {
         env.mock_all_auths();
 
         let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
-        let asset_id = register_asset(&env, &asset_registry_client);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
         let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
 
         let history_key = (symbol_short!("HIST"), asset_id);
         let score_key = (symbol_short!("SCORE"), asset_id);
@@ -5748,8 +5941,9 @@ mod tests {
         env.mock_all_auths();
 
         let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
-        let asset_id = register_asset(&env, &asset_registry_client);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
         let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
 
         let history_key = (symbol_short!("HIST"), asset_id);
         let score_key = (symbol_short!("SCORE"), asset_id);
@@ -5786,8 +5980,9 @@ mod tests {
         env.mock_all_auths();
 
         let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
-        let asset_id = register_asset(&env, &asset_registry_client);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
         let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
 
         let score_history_key = (symbol_short!("SCHIST"), asset_id);
         let contract_id = client.address.clone();
@@ -5816,8 +6011,9 @@ mod tests {
         env.mock_all_auths();
 
         let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
-        let asset_id = register_asset(&env, &asset_registry_client);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
         let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
 
         let score_history_key = (symbol_short!("SCHIST"), asset_id);
         let contract_id = client.address.clone();
@@ -5851,8 +6047,9 @@ mod tests {
         env.mock_all_auths();
 
         let (client, asset_registry_client, engineer_registry_client, admin) = setup(&env, 0);
-        let asset_id = register_asset(&env, &asset_registry_client);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
         let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
 
         client.submit_maintenance(
             &asset_id,
@@ -5885,8 +6082,9 @@ mod tests {
         env.mock_all_auths();
 
         let (client, asset_registry_client, engineer_registry_client, admin) = setup(&env, 0);
-        let asset_id = register_asset(&env, &asset_registry_client);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
         let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
 
         client.pause(&admin);
 
@@ -5900,7 +6098,7 @@ mod tests {
             client.try_submit_maintenance(
                 &asset_id,
                 &symbol_short!("OIL_CHG"),
-                &String::from_str(&env, ""),
+                &String::from_str(&env, "ok"),
                 &engineer
             ),
             Err(Ok(soroban_sdk::Error::from_contract_error(
@@ -5912,7 +6110,7 @@ mod tests {
         let mut records = Vec::new(&env);
         records.push_back(BatchRecord {
             task_type: symbol_short!("OIL_CHG"),
-            notes: String::from_str(&env, ""),
+            notes: String::from_str(&env, "ok"),
         });
         assert_eq!(
             client.try_batch_submit_maintenance(&asset_id, &records, &engineer),
@@ -6010,8 +6208,9 @@ mod tests {
 
         // submit_maintenance must still be blocked
         let (_, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
-        let asset_id = register_asset(&env, &asset_registry_client);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
         let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
         assert_eq!(
             client.try_submit_maintenance(
                 &asset_id,
@@ -6031,9 +6230,11 @@ mod tests {
         env.mock_all_auths();
 
         let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
-        let asset1 = register_asset(&env, &asset_registry_client);
-        let asset2 = register_asset(&env, &asset_registry_client);
+        let (asset1, asset1_owner) = register_asset(&env, &asset_registry_client);
+        let (asset2, asset2_owner) = register_asset(&env, &asset_registry_client);
         let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset1_owner, &asset1, &engineer);
+        client.authorize_engineer(&asset2_owner, &asset2, &engineer);
 
         client.submit_maintenance(
             &asset1,
@@ -6062,8 +6263,9 @@ mod tests {
         env.mock_all_auths();
 
         let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
-        let asset_id = register_asset(&env, &asset_registry_client);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
         let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
 
         // 9 ÃƒÆ’Ã¢â‚¬â€ FILTER (5 pts each) = 45 ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â below threshold of 50
         for _ in 0..9 {
@@ -6103,6 +6305,7 @@ mod tests {
         let asset_id = asset_registry.register_asset(
             &symbol_short!("GENSET"),
             &String::from_str(&env, "CAT 3516 Generator"),
+            &unique_serial(&env),
             &owner,
         );
         assert_eq!(asset_registry.get_asset(&asset_id).owner, owner);
@@ -6187,6 +6390,7 @@ mod tests {
         let asset_id = asset_registry.register_asset(
             &symbol_short!("GENSET"),
             &String::from_str(&env, "Generator GEN-001"),
+            &unique_serial(&env),
             &owner,
         );
         engineer_registry.register_engineer(
@@ -6250,6 +6454,7 @@ mod tests {
         let asset_id = asset_registry.register_asset(
             &symbol_short!("GENSET"),
             &String::from_str(&env, "Generator NON-OWNER-TEST"),
+            &unique_serial(&env),
             &real_owner,
         );
 
@@ -6286,6 +6491,7 @@ mod tests {
         let asset_id = asset_registry.register_asset(
             &symbol_short!("GENSET"),
             &String::from_str(&env, "Generator XFER-IDX-001"),
+            &unique_serial(&env),
             &owner,
         );
         engineer_registry.register_engineer(
@@ -6351,6 +6557,7 @@ mod tests {
         let asset_id = asset_registry.register_asset(
             &symbol_short!("GENSET"),
             &String::from_str(&env, "Generator GEN-PURGE-001"),
+            &unique_serial(&env),
             &owner,
         );
         engineer_registry.register_engineer(
@@ -6521,14 +6728,15 @@ mod tests {
         env.mock_all_auths();
 
         let (client, asset_registry_client, engineer_registry_client, admin) = setup(&env, 0);
-        let asset_id = register_asset(&env, &asset_registry_client);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
         let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
 
         // Build score to 5 (one ENGINE task, score_increment = 5)
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("ENGINE"),
-            &String::from_str(&env, ""),
+            &String::from_str(&env, "ok"),
             &engineer,
         );
         assert_eq!(client.get_collateral_score(&asset_id), 5);
@@ -6563,8 +6771,9 @@ mod tests {
         env.mock_all_auths();
 
         let (lifecycle, asset_registry, engineer_registry, admin) = setup(&env, 0);
-        let asset_id = register_asset(&env, &asset_registry);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry);
         let engineer = register_engineer(&env, &engineer_registry);
+        lifecycle.authorize_engineer(&asset_owner, &asset_id, &engineer);
 
         // Engineer performs maintenance on the asset
         lifecycle.submit_maintenance(
@@ -6576,7 +6785,7 @@ mod tests {
 
         // Verify asset_id is in engineer's history
         let history = lifecycle.get_eng_history_page(&engineer, &0, &10);
-        assert!(history.contains(asset_id));
+        assert!(history.contains(&asset_id));
 
         // Purge the asset
         lifecycle.purge_asset_data(&admin, &asset_id);
@@ -6584,7 +6793,7 @@ mod tests {
         // BUG: Currently, asset_id is STILL in engineer's history
         let history_after = lifecycle.get_eng_history_page(&engineer, &0, &10);
         assert!(
-            !history_after.contains(asset_id),
+            !history_after.contains(&asset_id),
             "Asset ID should be removed from engineer history after purge"
         );
     }
@@ -6639,8 +6848,9 @@ mod tests {
         env.mock_all_auths();
 
         let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
-        let asset_id = register_asset(&env, &asset_registry_client);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
         let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
 
         // One record → raw score = DEFAULT_SCORE_INCREMENT (5)
         client.submit_maintenance(
@@ -6677,6 +6887,7 @@ mod tests {
         let asset_id_genset = asset_registry_client.register_asset(
             &symbol_short!("GENSET"),
             &String::from_str(&env, "Caterpillar 3516"),
+            &unique_serial(&env),
             &owner_a,
         );
 
@@ -6684,6 +6895,7 @@ mod tests {
         let asset_id_turbine = asset_registry_client.register_asset(
             &symbol_short!("TURBINE"),
             &String::from_str(&env, "Siemens SGT-800"),
+            &unique_serial(&env),
             &owner_b,
         );
 
@@ -6692,7 +6904,7 @@ mod tests {
         client.authorize_engineer(&owner_b, &asset_id_turbine, &engineer);
 
         for i in 0..110 {
-            let note = String::from_str(&env, &format!("Record {}", i));
+            let note = String::from_str(&env, "Record");
             client.submit_maintenance(
                 &asset_id_genset,
                 &symbol_short!("ENGINE"),
@@ -6722,8 +6934,8 @@ mod tests {
         env.mock_all_auths();
 
         let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
-        let asset_id_recent = register_asset(&env, &asset_registry_client);
-        let asset_id_old = register_asset(&env, &asset_registry_client);
+        let (asset_id_recent, asset_owner_recent) = register_asset(&env, &asset_registry_client);
+        let (asset_id_old, asset_owner_old) = register_asset(&env, &asset_registry_client);
         let engineer = register_engineer(&env, &engineer_registry_client);
 
         // Submit maintenance for both assets at the same time
@@ -6798,7 +7010,7 @@ mod tests {
         env.mock_all_auths();
 
         let (client, asset_registry_client, _, _) = setup(&env, 0);
-        let asset_id = register_asset(&env, &asset_registry_client);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
 
         let result = client.try_request_loan(&asset_id, &0_u32, &1_i128);
         assert_eq!(
@@ -6815,7 +7027,7 @@ mod tests {
         env.mock_all_auths();
 
         let (client, asset_registry_client, _, _) = setup(&env, 0);
-        let asset_id = register_asset(&env, &asset_registry_client);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
 
         let result = client.try_request_loan(&asset_id, &1_u32, &0_i128);
         assert_eq!(
@@ -6823,6 +7035,91 @@ mod tests {
             Err(Ok(soroban_sdk::Error::from_contract_error(
                 ContractError::InvalidConfig as u32,
             ))),
+        );
+    }
+
+    // --- Issue: Freeze score on decommission ---
+
+    #[test]
+    fn test_score_does_not_decay_after_decommission_notify() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
+        let owner = Address::generate(&env);
+        let asset_id = register_asset_for_owner(&env, &asset_registry_client, &owner);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&owner, &asset_id, &engineer);
+
+        // Build up a non-zero score
+        client.submit_maintenance(
+            &asset_id,
+            &symbol_short!("OIL_CHG"),
+            &String::from_str(&env, "Pre-decommission maintenance"),
+            &engineer,
+        );
+        let score_before = client.get_collateral_score(&asset_id);
+        assert!(score_before > 0, "score must be non-zero before decommission");
+
+        // Notify lifecycle that the asset has been decommissioned
+        client.decommission_notify(&asset_id);
+
+        // Advance time well past a decay interval to confirm no decay occurs
+        env.ledger().with_mut(|li| li.timestamp += 10_000_000);
+
+        let score_after = client.get_collateral_score(&asset_id);
+        assert_eq!(
+            score_after, score_before,
+            "score must not decay after decommission_notify"
+        );
+
+        // decay_score should also be a no-op for frozen assets
+        let decayed = client.decay_score(&asset_id);
+        assert_eq!(
+            decayed, score_before,
+            "decay_score must return the frozen score for decommissioned assets"
+        );
+    }
+
+    // --- Issue: Zero-address check in update_asset_registry / update_engineer_registry ---
+
+    #[test]
+    fn test_update_asset_registry_rejects_zero_address() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, _, _, admin) = setup(&env, 0);
+        let zero_addr = Address::from_str(
+            &env,
+            "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4",
+        );
+
+        let result = client.try_update_asset_registry(&admin, &zero_addr);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::ZeroAddress as u32
+            )))
+        );
+    }
+
+    #[test]
+    fn test_update_engineer_registry_rejects_zero_address() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, _, _, admin) = setup(&env, 0);
+        let zero_addr = Address::from_str(
+            &env,
+            "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4",
+        );
+
+        let result = client.try_update_engineer_registry(&admin, &zero_addr);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::ZeroAddress as u32
+            )))
         );
     }
 }
