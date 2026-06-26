@@ -51,6 +51,16 @@ pub struct AssetInput {
     pub serial_number: String,
 }
 
+/// Paginated result for `get_assets_by_type_paginated`.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AssetTypePage {
+    /// Asset IDs for the requested page.
+    pub assets: Vec<u64>,
+    /// Total number of assets of this type across all pages.
+    pub total: u32,
+}
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TimelockProposal {
@@ -712,6 +722,60 @@ impl AssetRegistry {
             page.push_back(all.get(i).unwrap());
         }
         page
+    }
+
+    /// Returns a page of asset IDs for the given type together with the total count.
+    /// Designed for large fleets where returning the full list would exceed Soroban's
+    /// return data limits.
+    ///
+    /// # Arguments
+    /// * `asset_type` - The asset type symbol to query
+    /// * `page` - Zero-based page index
+    /// * `page_size` - Maximum number of asset IDs per page (capped at 100)
+    ///
+    /// # Returns
+    /// `AssetTypePage` containing the requested slice and the total asset count
+    pub fn get_assets_by_type_paginated(
+        env: Env,
+        asset_type: Symbol,
+        page: u32,
+        page_size: u32,
+    ) -> AssetTypePage {
+        const MAX_PAGE_SIZE: u32 = 100;
+        let page_size = page_size.min(MAX_PAGE_SIZE);
+
+        let key = type_assets_key(&asset_type);
+        let all: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| Vec::new(&env));
+        if env.storage().persistent().has(&key) {
+            env.storage().persistent().extend_ttl(&key, 518400, 518400);
+        }
+
+        let total = all.len();
+
+        if page_size == 0 {
+            return AssetTypePage { assets: Vec::new(&env), total };
+        }
+
+        let offset = match page.checked_mul(page_size) {
+            Some(o) => o,
+            None => return AssetTypePage { assets: Vec::new(&env), total },
+        };
+
+        if offset >= total {
+            return AssetTypePage { assets: Vec::new(&env), total };
+        }
+
+        let end = (offset + page_size).min(total);
+        let mut assets = Vec::new(&env);
+        for i in offset..end {
+            assets.push_back(all.get(i).unwrap());
+        }
+
+        AssetTypePage { assets, total }
     }
 
     /// Initialize the admin address for the contract.
@@ -4112,6 +4176,129 @@ mod tests {
             &owner,
         );
         assert_eq!(client.get_asset_count(), 3);
+    }
+
+    // --- Issue: get_assets_by_type_paginated tests ---
+
+    fn setup_with_types_for_pagination(env: &Env) -> (AssetRegistryClient, Address) {
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(env, &contract_id);
+        let admin = Address::generate(env);
+        client.initialize_admin(&admin, &admin);
+        client.add_asset_type(&admin, &symbol_short!("GENSET"));
+        client.add_asset_type(&admin, &symbol_short!("TURBINE"));
+        let owner = Address::generate(env);
+        (client, owner)
+    }
+
+    #[test]
+    fn test_get_assets_by_type_paginated_standard() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, owner) = setup_with_types_for_pagination(&env);
+
+        for i in 0..7u32 {
+            client.register_asset(
+                &symbol_short!("GENSET"),
+                &String::from_str(&env, &std::format!("Generator {i}")),
+                &unique_serial(&env),
+                &owner,
+            );
+        }
+
+        // Page 0: items 0-2
+        let p0 = client.get_assets_by_type_paginated(&symbol_short!("GENSET"), &0, &3);
+        assert_eq!(p0.total, 7);
+        assert_eq!(p0.assets.len(), 3);
+
+        // Page 1: items 3-5
+        let p1 = client.get_assets_by_type_paginated(&symbol_short!("GENSET"), &1, &3);
+        assert_eq!(p1.total, 7);
+        assert_eq!(p1.assets.len(), 3);
+
+        // Page 2: item 6 (last page, partial)
+        let p2 = client.get_assets_by_type_paginated(&symbol_short!("GENSET"), &2, &3);
+        assert_eq!(p2.total, 7);
+        assert_eq!(p2.assets.len(), 1);
+    }
+
+    #[test]
+    fn test_get_assets_by_type_paginated_empty_type() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _) = setup_with_types_for_pagination(&env);
+
+        // No assets of type TURBINE registered
+        let result = client.get_assets_by_type_paginated(&symbol_short!("TURBINE"), &0, &10);
+        assert_eq!(result.total, 0);
+        assert_eq!(result.assets.len(), 0);
+    }
+
+    #[test]
+    fn test_get_assets_by_type_paginated_out_of_bounds() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, owner) = setup_with_types_for_pagination(&env);
+
+        client.register_asset(
+            &symbol_short!("GENSET"),
+            &String::from_str(&env, "Generator 0"),
+            &unique_serial(&env),
+            &owner,
+        );
+
+        // Page beyond the end returns empty assets but correct total
+        let result = client.get_assets_by_type_paginated(&symbol_short!("GENSET"), &5, &10);
+        assert_eq!(result.total, 1);
+        assert_eq!(result.assets.len(), 0);
+    }
+
+    #[test]
+    fn test_get_assets_by_type_paginated_page_size_capped_at_100() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, owner) = setup_with_types_for_pagination(&env);
+
+        for i in 0..50u32 {
+            client.register_asset(
+                &symbol_short!("GENSET"),
+                &String::from_str(&env, &std::format!("Generator {i}")),
+                &unique_serial(&env),
+                &owner,
+            );
+        }
+
+        // page_size=200 is capped to 100, so at most 100 assets returned
+        let result = client.get_assets_by_type_paginated(&symbol_short!("GENSET"), &0, &200);
+        assert_eq!(result.total, 50);
+        assert_eq!(result.assets.len(), 50); // only 50 assets exist
+    }
+
+    #[test]
+    fn test_get_assets_by_type_paginated_total_matches_across_pages() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, owner) = setup_with_types_for_pagination(&env);
+
+        for i in 0..12u32 {
+            client.register_asset(
+                &symbol_short!("GENSET"),
+                &String::from_str(&env, &std::format!("Generator {i}")),
+                &unique_serial(&env),
+                &owner,
+            );
+        }
+
+        // Total reported on every page must be the same
+        let p0 = client.get_assets_by_type_paginated(&symbol_short!("GENSET"), &0, &5);
+        let p1 = client.get_assets_by_type_paginated(&symbol_short!("GENSET"), &1, &5);
+        let p2 = client.get_assets_by_type_paginated(&symbol_short!("GENSET"), &2, &5);
+        assert_eq!(p0.total, 12);
+        assert_eq!(p1.total, 12);
+        assert_eq!(p2.total, 12);
+
+        // Pages cover all 12 assets without overlap: 5 + 5 + 2 = 12
+        assert_eq!(p0.assets.len() + p1.assets.len() + p2.assets.len(), 12);
     }
 }
 }
