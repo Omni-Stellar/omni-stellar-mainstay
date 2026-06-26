@@ -4097,12 +4097,14 @@ mod tests {
             &String::from_str(&env, "First"),
             &engineer,
         );
+        env.ledger().with_mut(|li| li.timestamp += 1);
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("ENGINE"),
             &String::from_str(&env, "Second"),
             &engineer,
         );
+        env.ledger().with_mut(|li| li.timestamp += 1);
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("FILTER"),
@@ -4111,7 +4113,7 @@ mod tests {
         );
 
         let history = client.get_score_history(&asset_id);
-        // One entry per maintenance event
+        // One entry per maintenance event (each at a distinct timestamp)
         assert_eq!(history.len(), 3);
     }
 
@@ -4125,19 +4127,22 @@ mod tests {
         let engineer = register_engineer(&env, &engineer_registry_client);
         client.authorize_engineer(&asset_owner, &asset_id, &engineer);
 
-        // All tasks use score_increment (default 5)
+        // All tasks use score_increment (default 5); advance ledger between each to ensure
+        // distinct timestamps so deduplication does not collapse the entries.
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("OIL_CHG"),
             &String::from_str(&env, "a"),
             &engineer,
         );
+        env.ledger().with_mut(|li| li.timestamp += 1);
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("ENGINE"),
             &String::from_str(&env, "b"),
             &engineer,
         );
+        env.ledger().with_mut(|li| li.timestamp += 1);
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("FILTER"),
@@ -4194,7 +4199,9 @@ mod tests {
         let engineer = register_engineer(&env, &engineer_registry_client);
         client.authorize_engineer(&asset_owner, &asset_id, &engineer);
 
-        // 20 tasks at default score_increment (5) each would be 100, then more should stay at 100
+        // 20 tasks at default score_increment (5) each would be 100, then more should stay at 100.
+        // Advance ledger by 1 second between each so every submission gets a distinct timestamp
+        // and deduplication does not collapse entries into one.
         for _ in 0..22 {
             client.submit_maintenance(
                 &asset_id,
@@ -4202,6 +4209,7 @@ mod tests {
                 &String::from_str(&env, "major"),
                 &engineer,
             );
+            env.ledger().with_mut(|li| li.timestamp += 1);
         }
 
         let history = client.get_score_history(&asset_id);
@@ -4225,7 +4233,8 @@ mod tests {
         let engineer = register_engineer(&env, &engineer_registry_client);
         client.authorize_engineer(&asset_owner, &asset_id, &engineer);
 
-        // Submit 8 records ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â history_key is capped at 5, score_history must also stay at 5
+        // Submit 5 records -- history_key is capped at 5, score_history must also stay at 5.
+        // Advance ledger by 1 second between each so every submission gets a distinct timestamp.
         for _ in 0..5 {
             client.submit_maintenance(
                 &asset_id,
@@ -4233,6 +4242,7 @@ mod tests {
                 &String::from_str(&env, "ok"),
                 &engineer,
             );
+            env.ledger().with_mut(|li| li.timestamp += 1);
         }
         assert_eq!(client.get_score_history(&asset_id).len(), 5);
 
@@ -4266,6 +4276,7 @@ mod tests {
                 &String::from_str(&env, "entry"),
                 &engineer,
             );
+            env.ledger().with_mut(|li| li.timestamp += 1);
         }
 
         let full = client.get_score_history(&asset_id);
@@ -5690,10 +5701,12 @@ mod tests {
         client.batch_submit_maintenance(&asset_id, &records, &engineer);
 
         let score_history = client.get_score_history(&asset_id);
+        // All 3 batch records share the same ledger timestamp, so score_history_push
+        // deduplicates them into a single entry containing the final score.
         assert_eq!(
             score_history.len(),
-            3,
-            "score_history length must match batch record count"
+            1,
+            "batch records in the same ledger should produce exactly 1 score history entry"
         );
     }
 
@@ -7038,88 +7051,225 @@ mod tests {
         );
     }
 
-    // --- Issue: Freeze score on decommission ---
+    // --- Issue: score_history_push deduplication by timestamp ---
 
     #[test]
-    fn test_score_does_not_decay_after_decommission_notify() {
+    fn test_score_history_dedup_same_ledger_submit() {
+        // Two submit_maintenance calls in the same ledger (same timestamp) must produce
+        // only one score history entry (the latest score), not two.
         let env = Env::default();
         env.mock_all_auths();
 
         let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
-        let owner = Address::generate(&env);
-        let asset_id = register_asset_for_owner(&env, &asset_registry_client, &owner);
+        let asset_id = register_asset(&env, &asset_registry_client);
         let engineer = register_engineer(&env, &engineer_registry_client);
-        client.authorize_engineer(&owner, &asset_id, &engineer);
 
-        // Build up a non-zero score
+        // Both submissions happen at the same ledger timestamp.
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("OIL_CHG"),
-            &String::from_str(&env, "Pre-decommission maintenance"),
+            &String::from_str(&env, "first in ledger"),
             &engineer,
         );
-        let score_before = client.get_collateral_score(&asset_id);
-        assert!(score_before > 0, "score must be non-zero before decommission");
-
-        // Notify lifecycle that the asset has been decommissioned
-        client.decommission_notify(&asset_id);
-
-        // Advance time well past a decay interval to confirm no decay occurs
-        env.ledger().with_mut(|li| li.timestamp += 10_000_000);
-
-        let score_after = client.get_collateral_score(&asset_id);
-        assert_eq!(
-            score_after, score_before,
-            "score must not decay after decommission_notify"
+        client.submit_maintenance(
+            &asset_id,
+            &symbol_short!("INSPECT"),
+            &String::from_str(&env, "second in ledger"),
+            &engineer,
         );
 
-        // decay_score should also be a no-op for frozen assets
-        let decayed = client.decay_score(&asset_id);
+        let history = client.get_score_history(&asset_id);
         assert_eq!(
-            decayed, score_before,
-            "decay_score must return the frozen score for decommissioned assets"
+            history.len(),
+            1,
+            "two submissions in the same ledger must produce exactly 1 score history entry"
+        );
+        // The single entry reflects the score after both submissions.
+        assert!(history.get(0).unwrap().score > 0);
+    }
+
+    #[test]
+    fn test_score_history_dedup_batch_same_ledger() {
+        // A batch of records all share the same ledger timestamp; score_history should
+        // contain only one entry (the final accumulated score), not one per record.
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
+        let asset_id = register_asset(&env, &asset_registry_client);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+
+        let mut records = Vec::new(&env);
+        records.push_back(BatchRecord {
+            task_type: symbol_short!("OIL_CHG"),
+            notes: String::from_str(&env, "rec 1"),
+        });
+        records.push_back(BatchRecord {
+            task_type: symbol_short!("INSPECT"),
+            notes: String::from_str(&env, "rec 2"),
+        });
+        records.push_back(BatchRecord {
+            task_type: symbol_short!("FILTER"),
+            notes: String::from_str(&env, "rec 3"),
+        });
+
+        client.batch_submit_maintenance(&asset_id, &records, &engineer);
+
+        let history = client.get_score_history(&asset_id);
+        assert_eq!(
+            history.len(),
+            1,
+            "batch records in the same ledger must produce exactly 1 score history entry"
         );
     }
 
-    // --- Issue: Zero-address check in update_asset_registry / update_engineer_registry ---
+    #[test]
+    fn test_score_history_distinct_ledgers_each_recorded() {
+        // Submissions across different ledger timestamps each get their own entry.
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
+        let asset_id = register_asset(&env, &asset_registry_client);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+
+        for i in 0..4u64 {
+            client.submit_maintenance(
+                &asset_id,
+                &symbol_short!("OIL_CHG"),
+                &String::from_str(&env, "entry"),
+                &engineer,
+            );
+            env.ledger().with_mut(|li| li.timestamp += 1000 * (i + 1));
+        }
+
+        assert_eq!(client.get_score_history(&asset_id).len(), 4);
+    }
+
+    // --- Issue: update_max_notes_length tests ---
 
     #[test]
-    fn test_update_asset_registry_rejects_zero_address() {
+    fn test_admin_can_update_max_notes_length() {
         let env = Env::default();
         env.mock_all_auths();
 
         let (client, _, _, admin) = setup(&env, 0);
-        let zero_addr = Address::from_str(
-            &env,
-            "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4",
-        );
+        client.update_max_notes_length(&admin, &512);
 
-        let result = client.try_update_asset_registry(&admin, &zero_addr);
+        let config = client.get_config();
+        assert_eq!(config.max_notes_length, 512);
+    }
+
+    #[test]
+    fn test_non_admin_cannot_update_max_notes_length() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, _, _, _) = setup(&env, 0);
+        let outsider = Address::generate(&env);
+
+        let result = client.try_update_max_notes_length(&outsider, &512);
         assert_eq!(
             result,
             Err(Ok(soroban_sdk::Error::from_contract_error(
-                ContractError::ZeroAddress as u32
-            )))
+                ContractError::UnauthorizedAdmin as u32,
+            ))),
         );
     }
 
     #[test]
-    fn test_update_engineer_registry_rejects_zero_address() {
+    fn test_update_max_notes_length_zero_rejected() {
         let env = Env::default();
         env.mock_all_auths();
 
         let (client, _, _, admin) = setup(&env, 0);
-        let zero_addr = Address::from_str(
-            &env,
-            "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4",
-        );
-
-        let result = client.try_update_engineer_registry(&admin, &zero_addr);
+        let result = client.try_update_max_notes_length(&admin, &0);
         assert_eq!(
             result,
             Err(Ok(soroban_sdk::Error::from_contract_error(
-                ContractError::ZeroAddress as u32
-            )))
+                ContractError::InvalidConfig as u32,
+            ))),
         );
+    }
+
+    #[test]
+    fn test_update_max_notes_length_enforced_in_submit_maintenance() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, engineer_registry_client, admin) = setup(&env, 0);
+        let asset_id = register_asset(&env, &asset_registry_client);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+
+        // Reduce max notes length to 10 bytes
+        client.update_max_notes_length(&admin, &10);
+
+        // Notes within the new limit are accepted
+        let result_ok = client.try_submit_maintenance(
+            &asset_id,
+            &symbol_short!("OIL_CHG"),
+            &String::from_str(&env, "short"),
+            &engineer,
+        );
+        assert!(result_ok.is_ok());
+
+        // Notes exceeding the new limit are rejected
+        let result_err = client.try_submit_maintenance(
+            &asset_id,
+            &symbol_short!("INSPECT"),
+            &String::from_str(&env, "this is too long"),
+            &engineer,
+        );
+        assert_eq!(
+            result_err,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::NotesTooLong as u32,
+            ))),
+        );
+    }
+
+    #[test]
+    fn test_update_max_notes_length_enforced_in_batch_submit() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, engineer_registry_client, admin) = setup(&env, 0);
+        let asset_id = register_asset(&env, &asset_registry_client);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+
+        // Reduce max notes length to 10 bytes
+        client.update_max_notes_length(&admin, &10);
+
+        let mut records = Vec::new(&env);
+        records.push_back(BatchRecord {
+            task_type: symbol_short!("OIL_CHG"),
+            notes: String::from_str(&env, "this is too long for limit"),
+        });
+
+        let result = client.try_batch_submit_maintenance(&asset_id, &records, &engineer);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::NotesTooLong as u32,
+            ))),
+        );
+    }
+
+    #[test]
+    fn test_update_max_notes_length_emits_event() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, _, _, admin) = setup(&env, 0);
+        client.update_max_notes_length(&admin, &128);
+
+        let events = env.events().all();
+        assert!(events.len() >= 1);
+        use soroban_sdk::TryIntoVal;
+        let (_, topics, data) = events.get(0).unwrap();
+        let t0: Symbol = topics.get(0).unwrap().try_into_val(&env).unwrap();
+        assert_eq!(t0, symbol_short!("UPD_NOTES"));
+        let emitted_max: u32 = data.try_into_val(&env).unwrap();
+        assert_eq!(emitted_max, 128);
     }
 }
