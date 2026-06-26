@@ -1313,11 +1313,25 @@ impl Lifecycle {
             .get::<_, Vec<MaintenanceRecord>>(&history_key(asset_id))
             .map(|h| !h.is_empty())
             .unwrap_or(false);
-        if has_history && score < MIN_SCORE_WITH_HISTORY {
+        let final_score = if has_history && score < MIN_SCORE_WITH_HISTORY {
             MIN_SCORE_WITH_HISTORY
         } else {
             score
-        }
+        };
+        // Persist the computed score so stored and returned values are always consistent.
+        env.storage()
+            .persistent()
+            .set(&score_key(asset_id), &final_score);
+        env.storage()
+            .persistent()
+            .extend_ttl(&score_key(asset_id), TTL_THRESHOLD, TTL_TARGET);
+        env.storage()
+            .persistent()
+            .set(&last_update_key(asset_id), &env.ledger().timestamp());
+        env.storage()
+            .persistent()
+            .extend_ttl(&last_update_key(asset_id), TTL_THRESHOLD, TTL_TARGET);
+        final_score
     }
 
     /// Get collateral scores for multiple assets in a single call.
@@ -7106,5 +7120,42 @@ mod tests {
         assert_eq!(t0, symbol_short!("UPD_NOTES"));
         let emitted_max: u32 = data.try_into_val(&env).unwrap();
         assert_eq!(emitted_max, 128);
+    }
+
+    #[test]
+    fn test_get_collateral_score_persists_returned_value() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (lifecycle, asset_registry, eng_registry, _admin) = setup(&env, 10);
+        let asset_id = register_asset(&env, &asset_registry);
+        let engineer = Address::generate(&env);
+        let cred_hash = BytesN::from_array(&env, &[1u8; 32]);
+        let issuer = Address::generate(&env);
+        eng_registry.register_engineer(&engineer, &cred_hash, &issuer);
+
+        lifecycle.submit_maintenance(
+            &asset_id,
+            &symbol_short!("OIL_CHG"),
+            &String::from_str(&env, "oil change"),
+            &engineer,
+        );
+
+        // Call get_collateral_score and capture returned value.
+        let returned = lifecycle.get_collateral_score(&asset_id);
+
+        // Read the persisted SCORE key directly from storage.
+        let stored: u32 = env
+            .as_contract(&lifecycle.address, || {
+                env.storage()
+                    .persistent()
+                    .get(&score_key(asset_id))
+                    .unwrap_or(0u32)
+            });
+
+        assert_eq!(
+            returned, stored,
+            "stored score ({stored}) must match returned score ({returned})"
+        );
     }
 }
