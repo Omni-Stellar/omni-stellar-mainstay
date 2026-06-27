@@ -1036,6 +1036,9 @@ impl Lifecycle {
         // Cross-check engineer credential via registry
         let registry_id = get_engineer_registry_addr(&env);
         let registry = engineer_registry::EngineerRegistryClient::new(&env, &registry_id);
+        use engineer_registry::CredentialStatus;
+        let status = registry.verify_engineer(&engineer);
+        if status != CredentialStatus::Valid {
         let verified = registry.verify_engineer(&engineer).unwrap_or(false);
         if !verified {
             panic_with_error!(&env, ContractError::UnauthorizedEngineer);
@@ -1231,6 +1234,9 @@ impl Lifecycle {
         let engineer_registry = get_engineer_registry_addr(&env);
         let engineer_registry_client =
             engineer_registry::EngineerRegistryClient::new(&env, &engineer_registry);
+        use engineer_registry::CredentialStatus;
+        let status = engineer_registry_client.verify_engineer(&engineer);
+        if status != CredentialStatus::Valid {
         let mut batch = Vec::new(&env);
         batch.push_back(engineer.clone());
         let results = engineer_registry_client.batch_verify_engineers(&batch);
