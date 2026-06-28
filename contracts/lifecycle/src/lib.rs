@@ -4078,6 +4078,68 @@ mod tests {
     }
 
     #[test]
+
+    #[test]
+    fn test_is_collateral_eligible_with_sufficient_maintenance() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
+
+        // Default score_increment is 5, default threshold is 50
+        // So we need 10 maintenance events to reach 50
+        for _ in 0..10 {
+            client.submit_maintenance(
+                &asset_id,
+                &symbol_short!("OIL_CHG"),
+                &String::from_str(&env, "routine"),
+                &engineer,
+            );
+        }
+
+        assert!(client.is_collateral_eligible(&asset_id));
+    }
+
+    #[test]
+    fn test_is_collateral_eligible_just_above_threshold() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, engineer_registry_client, admin) = setup(&env, 0);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
+
+        // Set threshold to 30
+        client.update_eligibility_threshold(&admin, &30);
+
+        // Submit 6 maintenance events (6 * 5 = 30, but capped, need to check actual score)
+        for _ in 0..7 {
+            client.submit_maintenance(
+                &asset_id,
+                &symbol_short!("OIL_CHG"),
+                &String::from_str(&env, "routine"),
+                &engineer,
+            );
+        }
+
+        assert!(client.is_collateral_eligible(&asset_id));
+    }
+
+    #[test]
+    fn test_is_collateral_eligible_with_no_maintenance() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, _, _) = setup(&env, 0);
+        let (asset_id, _) = register_asset(&env, &asset_registry_client);
+
+        // Asset with no maintenance history should not be eligible
+        assert!(!client.is_collateral_eligible(&asset_id));
+    }
     fn test_batch_is_collateral_eligible_empty_input() {
         let env = Env::default();
         env.mock_all_auths();
