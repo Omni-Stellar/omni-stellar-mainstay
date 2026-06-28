@@ -12,7 +12,7 @@ use crate::types::{
 use shared::validation::require_non_empty_vec;
 use soroban_sdk::{
     contract, contractimpl, panic_with_error, symbol_short, Address, BytesN, Env, String, Symbol,
-    Vec,
+    Vec, Map,
 };
 
 const ASSET_REGISTRY: Symbol = symbol_short!("REGISTRY");
@@ -584,6 +584,7 @@ impl Lifecycle {
             decay_interval: DEFAULT_DECAY_INTERVAL,
             eligibility_threshold: DEFAULT_ELIGIBILITY_THRESHOLD,
             max_notes_length: DEFAULT_MAX_NOTES_LENGTH,
+            task_weights: Map::new(&env),
         };
         env.storage().persistent().set(&CONFIG, &config);
         env.storage()
@@ -978,6 +979,50 @@ impl Lifecycle {
             ),
         );
     }
+
+    /// Admin-only function to set a custom weight for a specific task type.
+    /// Allows per-task-type score increment configuration. Falls back to defaults if not set.
+    ///
+    /// # Arguments
+    /// * `admin` - The admin address that must match the stored config admin
+    /// * `task_type` - The task type symbol to configure
+    /// * `weight` - The weight/increment value for this task type
+    ///
+    /// # Panics
+    /// - [`ContractError::NotInitialized`] if contract has not been initialized
+    /// - [`ContractError::UnauthorizedAdmin`] if caller is not the admin
+    /// - [`ContractError::InvalidConfig`] if weight is 0
+    pub fn set_task_weight(env: Env, admin: Address, task_type: Symbol, weight: u32) {
+        ensure_not_paused(&env);
+        admin.require_auth();
+
+        if weight == 0 {
+            panic_with_error!(&env, ContractError::InvalidConfig);
+        }
+
+        let mut config: Config = env
+            .storage()
+            .persistent()
+            .get(&CONFIG)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
+        if config.admin != admin {
+            panic_with_error!(&env, ContractError::UnauthorizedAdmin);
+        }
+
+        config.task_weights.set(task_type.clone(), weight);
+        env.storage().persistent().set(&CONFIG, &config);
+        env.storage()
+            .persistent()
+            .extend_ttl(&CONFIG, TTL_THRESHOLD, TTL_TARGET);
+
+        env.events()
+            .publish((symbol_short!("TSK_WT"),), (task_type.clone(), weight));
+        env.events().publish(
+            (symbol_short!("ADM_AUD"), symbol_short!("TSK_WT")),
+            (admin, env.ledger().timestamp(), task_type, weight),
+        );
+    }
+
     /// Submit a maintenance record for an asset.
     /// Only verified engineers can submit maintenance records.
     ///
@@ -1015,7 +1060,7 @@ impl Lifecycle {
             .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
 
         // Validate task type early before cross-contract calls
-        let _weight = get_task_weight(&env, &task_type);
+        let _weight = get_task_weight(&env, &task_type, &config);
         validate_notes_length(&env, &notes, config.max_notes_length);
 
         // Check history cap before cross-contract calls to avoid wasting gas
@@ -1223,7 +1268,7 @@ impl Lifecycle {
         for record in records.iter() {
             validate_notes_length(&env, &record.notes, config.max_notes_length);
             // Validate task type is known
-            let _ = get_task_weight(&env, &record.task_type);
+            let _ = get_task_weight(&env, &record.task_type, &config);
         }
 
         // Validate asset exists
@@ -3112,6 +3157,124 @@ mod tests {
     #[test]
     fn test_update_max_history_zero_rejected() {
         let env = Env::default();
+
+    #[test]
+    fn test_set_task_weight_configures_custom_weight() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, engineer_registry_client, admin) = setup(&env, 0);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
+
+        // Set custom weight for OIL_CHG to 20
+        client.set_task_weight(&admin, &symbol_short!("OIL_CHG"), &20);
+
+        // Submit OIL_CHG maintenance and verify score uses custom weight
+        client.submit_maintenance(
+            &asset_id,
+            &symbol_short!("OIL_CHG"),
+            &String::from_str(&env, "custom weight test"),
+            &engineer,
+        );
+
+        let score = client.get_collateral_score(&asset_id);
+        assert_eq!(score, 20);
+    }
+
+    #[test]
+    fn test_set_task_weight_rejects_zero_weight() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, _, _, admin) = setup(&env, 0);
+
+        let result = client.try_set_task_weight(&admin, &symbol_short!("OIL_CHG"), &0);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::InvalidConfig as u32,
+            ))),
+        );
+    }
+
+    #[test]
+    fn test_set_task_weight_non_admin_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, _, _, _) = setup(&env, 0);
+        let not_admin = Address::generate(&env);
+
+        let result = client.try_set_task_weight(&not_admin, &symbol_short!("OIL_CHG"), &15);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::UnauthorizedAdmin as u32,
+            ))),
+        );
+    }
+
+    #[test]
+    fn test_set_task_weight_falls_back_to_defaults() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, engineer_registry_client, _admin) = setup(&env, 0);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
+
+        // Don't set custom weight - should use default
+        // OIL_CHG has default weight of 2 but score_increment is 5
+        // So first submission should give 5
+        client.submit_maintenance(
+            &asset_id,
+            &symbol_short!("OIL_CHG"),
+            &String::from_str(&env, "default weight test"),
+            &engineer,
+        );
+
+        let score = client.get_collateral_score(&asset_id);
+        assert_eq!(score, 5);
+    }
+
+    #[test]
+    fn test_set_multiple_task_weights() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, engineer_registry_client, admin) = setup(&env, 0);
+        let (asset_id1, asset_owner1) = register_asset(&env, &asset_registry_client);
+        let (asset_id2, asset_owner2) = register_asset(&env, &asset_registry_client);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner1, &asset_id1, &engineer);
+        client.authorize_engineer(&asset_owner2, &asset_id2, &engineer);
+
+        // Configure different weights
+        client.set_task_weight(&admin, &symbol_short!("OIL_CHG"), &10);
+        client.set_task_weight(&admin, &symbol_short!("ENGINE"), &50);
+
+        // Submit OIL_CHG to asset1
+        client.submit_maintenance(
+            &asset_id1,
+            &symbol_short!("OIL_CHG"),
+            &String::from_str(&env, "oil change"),
+            &engineer,
+        );
+
+        // Submit ENGINE to asset2
+        client.submit_maintenance(
+            &asset_id2,
+            &symbol_short!("ENGINE"),
+            &String::from_str(&env, "engine overhaul"),
+            &engineer,
+        );
+
+        assert_eq!(client.get_collateral_score(&asset_id1), 10);
+        assert_eq!(client.get_collateral_score(&asset_id2), 50);
+    }
         env.mock_all_auths();
 
         let (client, _, _, admin) = setup(&env, 0);
