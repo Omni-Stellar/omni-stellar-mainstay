@@ -61,3 +61,24 @@ tarpaulin-report.html
 # Profiling
 *.profdata
 *.profraw
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Node / frontend
+node_modules/
+.npm/
+dist/
+.DS_Store
+
+# Coverage / profiling
+lcov.info
+*.profraw
+*.profdata
+tarpaulin-report.html
+
+# Misc editor artifacts
+*.orig
+*.rej
