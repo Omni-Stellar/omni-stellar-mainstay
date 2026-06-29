@@ -1411,7 +1411,62 @@ impl Lifecycle {
     ///
     /// # Panics
     /// - [`ContractError::NotInitialized`] if contract has not been initialized
-    pub fn decommission_notify(env: Env, asset_id: u64) {
+    /// Notify lifecycle contract of asset ownership transfer.
+    /// Called by asset-registry to clear engineer authorizations for the new owner.
+    ///
+    /// # Arguments
+    /// * `asset_id` - The unique identifier of the transferred asset
+    /// * `new_owner` - The address of the new asset owner
+    ///
+    /// # Panics
+    /// - [`ContractError::NotInitialized`] if contract has not been initialized
+    /// - [`ContractError::UnauthorizedOwner`] if asset owner doesn't match
+    pub fn transfer_notify(env: Env, asset_id: u64, new_owner: Address) {
+        let asset_registry = get_asset_registry_addr(&env);
+        asset_registry.require_auth();
+        env.storage()
+            .persistent()
+            .get::<_, Config>(&CONFIG)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
+
+        // Verify asset exists and is owned by new_owner (as verified by asset-registry)
+        verify_asset_exists(&env, &asset_registry, &asset_id);
+        let asset = asset_registry::AssetRegistryClient::new(&env, &asset_registry).get_asset(&asset_id);
+        if asset.owner != new_owner {
+            panic_with_error!(&env, ContractError::UnauthorizedOwner);
+        }
+
+        // Clear engineer authorizations for the asset
+        if let Some(history) = env
+            .storage()
+            .persistent()
+            .get::<_, Vec<MaintenanceRecord>>(&history_key(asset_id))
+        {
+            let mut cleared_engineers = Vec::new(&env);
+            for record in history.iter() {
+                let eng = record.engineer.clone();
+                let mut already_cleared = false;
+                for cleared in cleared_engineers.iter() {
+                    if cleared == eng {
+                        already_cleared = true;
+                        break;
+                    }
+                }
+                if !already_cleared {
+                    env.storage()
+                        .persistent()
+                        .remove(&engineer_auth_key(asset_id, &eng));
+                    cleared_engineers.push_back(eng);
+                }
+            }
+        }
+
+        env.events()
+            .publish((symbol_short!("XFER"), asset_id), new_owner);
+    }
+
+    /// Decommission notify for lifecycle contract.
+
         let asset_registry = get_asset_registry_addr(&env);
         asset_registry.require_auth();
         env.storage()

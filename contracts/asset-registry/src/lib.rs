@@ -88,6 +88,7 @@ const ADMIN_KEY: Symbol = symbol_short!("ADMIN");
 const ASSET_TYPE_PREFIX: Symbol = symbol_short!("AST_TYPE");
 const PENDING_ADMIN_KEY: Symbol = symbol_short!("PADMIN");
 const DECOMM_PREFIX: Symbol = symbol_short!("DECOMM");
+const LIFECYCLE_KEY: Symbol = symbol_short!("LIFECYCLE");
 
 /// Soroban persistent-storage TTL constants.
 /// 1 ledger ≈ 5 seconds → 518_400 ledgers ≈ 30 days.
@@ -869,6 +870,36 @@ impl AssetRegistry {
             .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized))
     }
 
+    /// Set the lifecycle contract address for cross-contract notifications.
+    /// Only the admin can set this.
+    ///
+    /// # Arguments
+    /// * `admin` - The administrator making the update
+    /// * `lifecycle_addr` - The address of the lifecycle contract
+    ///
+    /// # Panics
+    /// - [`ContractError::UnauthorizedAdmin`] if caller is not the admin
+    pub fn set_lifecycle_contract(env: Env, admin: Address, lifecycle_addr: Address) {
+        admin.require_auth();
+        let stored_admin: Address = Self::get_admin(env.clone());
+        if stored_admin != admin {
+            panic_with_error!(&env, ContractError::UnauthorizedAdmin);
+        }
+        env.storage().instance().set(&LIFECYCLE_KEY, &lifecycle_addr);
+        env.storage().instance().extend_ttl(518400, 518400);
+    }
+
+    /// Get the configured lifecycle contract address.
+    ///
+    /// # Returns
+    /// The address of the lifecycle contract, or panics if not set
+    pub fn get_lifecycle_contract(env: Env) -> Address {
+        env.storage()
+            .instance()
+            .get(&LIFECYCLE_KEY)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized))
+    }
+
     /// Propose a new admin address (step 1 of 2-step transfer).
     /// Only the current admin can propose a new admin.
     ///
@@ -1169,6 +1200,12 @@ impl AssetRegistry {
         env.storage()
             .persistent()
             .extend_ttl(&asset_key(asset_id), TTL_THRESHOLD, TTL_TARGET);
+
+        // Notify lifecycle contract to clear engineer authorizations for the asset
+        if let Ok(lifecycle_addr) = env.storage().instance().get::<_, Address>(&LIFECYCLE_KEY) {
+            let lifecycle_client = lifecycle::LifecycleClient::new(&env, &lifecycle_addr);
+            lifecycle_client.transfer_notify(&asset_id, &new_owner);
+        }
 
         env.events().publish(
             (symbol_short!("TRANSFER"), asset_id),
@@ -1475,6 +1512,17 @@ impl AssetRegistry {
             &Symbol::new(&env, "decommission_notify"),
             args,
         );
+    }
+}
+
+// Minimal client interface for cross-contract call to Lifecycle
+mod lifecycle {
+    use soroban_sdk::{contractclient, Address, Env, Symbol, String};
+
+    #[allow(dead_code)]
+    #[contractclient(name = "LifecycleClient")]
+    pub trait Lifecycle {
+        fn transfer_notify(env: Env, asset_id: u64, new_owner: Address);
     }
 }
 
