@@ -985,6 +985,54 @@ impl Lifecycle {
         );
     }
 
+    /// Admin-only function to directly set the maximum allowed notes length.
+    /// Unlike `update_max_notes_length`, this takes effect immediately without a timelock.
+    /// Useful for deployments that need to quickly adjust storage cost controls.
+    ///
+    /// # Arguments
+    /// * `admin` - The admin address that must match the stored config admin
+    /// * `length` - New maximum notes length in bytes (must be > 0)
+    ///
+    /// # Panics
+    /// - [`ContractError::NotInitialized`] if contract has not been initialized
+    /// - [`ContractError::UnauthorizedAdmin`] if caller is not the admin
+    /// - [`ContractError::InvalidConfig`] if length is 0
+    pub fn set_max_notes_length(env: Env, admin: Address, length: u32) {
+        ensure_not_paused(&env);
+        admin.require_auth();
+
+        if length == 0 {
+            panic_with_error!(&env, ContractError::InvalidConfig);
+        }
+
+        let mut config: Config = env
+            .storage()
+            .persistent()
+            .get(&CONFIG)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
+        if config.admin != admin {
+            panic_with_error!(&env, ContractError::UnauthorizedAdmin);
+        }
+
+        config.max_notes_length = length;
+        env.storage().persistent().set(&CONFIG, &config);
+        env.storage()
+            .persistent()
+            .extend_ttl(&CONFIG, TTL_THRESHOLD, TTL_TARGET);
+
+        env.events()
+            .publish((symbol_short!("SET_NOTES"), admin.clone()), length);
+        env.events().publish(
+            (symbol_short!("ADM_AUD"), symbol_short!("CFG_UPD")),
+            (
+                admin,
+                env.ledger().timestamp(),
+                symbol_short!("MAX_NOTE"),
+                length,
+            ),
+        );
+    }
+
     /// Admin-only function to set a custom weight for a specific task type.
     /// Allows per-task-type score increment configuration. Falls back to defaults if not set.
     ///
@@ -1527,6 +1575,19 @@ impl Lifecycle {
         best
     }
 
+    /// View alias for [`get_last_service`].
+    /// Returns the most recent maintenance record for an asset, or `None` if no history exists.
+    /// Frontends and lenders should prefer this over fetching the full history.
+    ///
+    /// # Arguments
+    /// * `asset_id` - The unique identifier of the asset
+    ///
+    /// # Returns
+    /// `Some(MaintenanceRecord)` for the latest record, or `None` for assets with no history
+    pub fn get_last_maintenance(env: Env, asset_id: u64) -> Option<MaintenanceRecord> {
+        Self::get_last_service(env, asset_id)
+    }
+
     /// Get the current collateral score for an asset.
     /// Verifies asset exists before returning the score.
     ///
@@ -1551,6 +1612,11 @@ impl Lifecycle {
             .persistent()
             .get::<_, Config>(&CONFIG)
             .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
+        // Deprecated assets are not eligible for collateral — return 0 immediately.
+        let asset = asset_registry::AssetRegistryClient::new(&env, &asset_registry).get_asset(&asset_id);
+        if asset.deprecation_status != asset_registry::DeprecationStatus::Active {
+            return 0;
+        }
         // Frozen (decommissioned) assets return the score captured at decommission time.
         if env.storage().persistent().get::<_, bool>(&frozen_key(asset_id)).unwrap_or(false) {
             return env
@@ -3090,6 +3156,47 @@ mod tests {
 
         let last = client.get_last_service(&asset_id).unwrap();
         assert_eq!(last.timestamp, 2000);
+        assert_eq!(last.task_type, symbol_short!("INSPECT"));
+    }
+
+    #[test]
+    fn test_get_last_maintenance_none_for_no_history() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, _, _) = setup(&env, 0);
+        let (asset_id, _) = register_asset(&env, &asset_registry_client);
+        assert_eq!(client.get_last_maintenance(&asset_id), None);
+    }
+
+    #[test]
+    fn test_get_last_maintenance_returns_most_recent() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
+
+        env.ledger().set_timestamp(500);
+        client.submit_maintenance(
+            &asset_id,
+            &symbol_short!("OIL_CHG"),
+            &String::from_str(&env, "older"),
+            &engineer,
+        );
+
+        env.ledger().set_timestamp(1500);
+        client.submit_maintenance(
+            &asset_id,
+            &symbol_short!("INSPECT"),
+            &String::from_str(&env, "newer"),
+            &engineer,
+        );
+
+        let last = client.get_last_maintenance(&asset_id).unwrap();
+        assert_eq!(last.timestamp, 1500);
         assert_eq!(last.task_type, symbol_short!("INSPECT"));
     }
 
@@ -8580,5 +8687,105 @@ mod tests {
 
         let result = client.try_take_health_snapshot(&999u64);
         assert!(result.is_err(), "should error for unknown asset");
+    // --- Deprecation: collateral score tests ---
+
+    #[test]
+    fn test_deprecated_asset_returns_zero_collateral_score() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (lifecycle, asset_registry, _, _) = setup(&env, 200);
+        let (asset_id, owner) = register_asset(&env, &asset_registry);
+
+        // Confirm initial score is 0 (no maintenance history)
+        assert_eq!(lifecycle.get_collateral_score(&asset_id), 0);
+
+        // Deprecate the asset as the owner
+        asset_registry.deprecate_asset(&owner, &asset_id, &String::from_str(&env, "End of service life"));
+
+        // Score must be 0 for a deprecated asset regardless of any history
+        assert_eq!(lifecycle.get_collateral_score(&asset_id), 0);
+    }
+
+    #[test]
+    fn test_active_asset_not_affected_by_deprecation_of_other() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (lifecycle, asset_registry, _, _) = setup(&env, 200);
+        let (asset_id_1, owner) = register_asset(&env, &asset_registry);
+        let (asset_id_2, _) = register_asset(&env, &asset_registry);
+
+        // Deprecate only asset 1
+        asset_registry.deprecate_asset(&owner, &asset_id_1, &String::from_str(&env, "retired"));
+
+        // Asset 2 must still return its normal (0, no history) score — not forced to 0 by deprecation
+        assert_eq!(lifecycle.get_collateral_score(&asset_id_1), 0);
+        // Asset 2 is active, score is 0 simply because no maintenance has been submitted
+        assert_eq!(lifecycle.get_collateral_score(&asset_id_2), 0);
+    // --- Issue #830: set_max_notes_length ---
+
+    #[test]
+    fn test_set_max_notes_length_updates_config() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (lifecycle, _, _, admin) = setup(&env, 0);
+
+        lifecycle.set_max_notes_length(&admin, &128);
+
+        let config = lifecycle.get_config();
+        assert_eq!(config.max_notes_length, 128);
+    }
+
+    #[test]
+    fn test_set_max_notes_length_zero_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (lifecycle, _, _, admin) = setup(&env, 0);
+
+        let result = lifecycle.try_set_max_notes_length(&admin, &0);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::InvalidConfig as u32,
+            ))),
+        );
+    }
+
+    #[test]
+    fn test_set_max_notes_length_non_admin_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (lifecycle, _, _, _admin) = setup(&env, 0);
+
+        let outsider = Address::generate(&env);
+        let result = lifecycle.try_set_max_notes_length(&outsider, &64);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::UnauthorizedAdmin as u32,
+            ))),
+        );
+    }
+
+    #[test]
+    fn test_set_max_notes_length_emits_event() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (lifecycle, _, _, admin) = setup(&env, 0);
+
+        lifecycle.set_max_notes_length(&admin, &512);
+
+        use soroban_sdk::TryIntoVal;
+        let events = env.events().all();
+        let found = events.iter().any(|(_, topics, data)| {
+            topics
+                .get(0)
+                .and_then(|v| v.try_into_val::<_, Symbol>(&env).ok())
+                .map(|s| s == symbol_short!("SET_NOTES"))
+                .unwrap_or(false)
+                && data.try_into_val::<_, u32>(&env).ok() == Some(512)
+        });
+        assert!(found, "SET_NOTES event not emitted");
     }
 }
