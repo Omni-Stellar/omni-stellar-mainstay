@@ -2847,6 +2847,48 @@ mod tests {
         assert_eq!(active.get(0).unwrap(), eng2);
     }
 
+    // Closes #776
+    #[test]
+    fn test_get_active_engineers_by_issuer_excludes_revoked_and_expired() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin) = setup(&env);
+
+        let issuer = Address::generate(&env);
+        let eng_valid = Address::generate(&env);
+        let eng_revoked = Address::generate(&env);
+        let eng_expired = Address::generate(&env);
+        let hash = BytesN::from_array(&env, &[2u8; 32]);
+
+        client.add_trusted_issuer(&admin, &issuer);
+
+        // Valid engineer: 1-year credential, well within the window
+        client.register_engineer(&eng_valid, &hash, &issuer, &31_536_000, &None);
+        // Revoked engineer: registered with same long validity, then immediately revoked
+        client.register_engineer(&eng_revoked, &hash, &issuer, &31_536_000, &None);
+        // Expired engineer: registered with a 1-day credential
+        client.register_engineer(&eng_expired, &hash, &issuer, &86_400, &None);
+
+        client.revoke_credential(&eng_revoked);
+
+        // Advance ledger time past the expired engineer's expiry (86_400 seconds)
+        env.ledger().set_timestamp(86_401);
+
+        // Confirm individual statuses
+        assert_eq!(client.get_engineer_status(&eng_valid), EngineerStatus::Active);
+        assert_eq!(client.get_engineer_status(&eng_revoked), EngineerStatus::Revoked);
+        assert_eq!(client.get_engineer_status(&eng_expired), EngineerStatus::Expired);
+
+        // All three remain in the full issuer list
+        let all = client.get_engineers_by_issuer(&issuer);
+        assert_eq!(all.len(), 3);
+
+        // get_active_engineers_by_issuer must return only the valid engineer
+        let active = client.get_active_engineers_by_issuer(&issuer);
+        assert_eq!(active.len(), 1);
+        assert_eq!(active.get(0).unwrap(), eng_valid);
+    }
+
     #[test]
     fn test_propose_and_accept_admin() {
         let env = Env::default();
