@@ -980,6 +980,54 @@ impl Lifecycle {
         );
     }
 
+    /// Admin-only function to directly set the maximum allowed notes length.
+    /// Unlike `update_max_notes_length`, this takes effect immediately without a timelock.
+    /// Useful for deployments that need to quickly adjust storage cost controls.
+    ///
+    /// # Arguments
+    /// * `admin` - The admin address that must match the stored config admin
+    /// * `length` - New maximum notes length in bytes (must be > 0)
+    ///
+    /// # Panics
+    /// - [`ContractError::NotInitialized`] if contract has not been initialized
+    /// - [`ContractError::UnauthorizedAdmin`] if caller is not the admin
+    /// - [`ContractError::InvalidConfig`] if length is 0
+    pub fn set_max_notes_length(env: Env, admin: Address, length: u32) {
+        ensure_not_paused(&env);
+        admin.require_auth();
+
+        if length == 0 {
+            panic_with_error!(&env, ContractError::InvalidConfig);
+        }
+
+        let mut config: Config = env
+            .storage()
+            .persistent()
+            .get(&CONFIG)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
+        if config.admin != admin {
+            panic_with_error!(&env, ContractError::UnauthorizedAdmin);
+        }
+
+        config.max_notes_length = length;
+        env.storage().persistent().set(&CONFIG, &config);
+        env.storage()
+            .persistent()
+            .extend_ttl(&CONFIG, TTL_THRESHOLD, TTL_TARGET);
+
+        env.events()
+            .publish((symbol_short!("SET_NOTES"), admin.clone()), length);
+        env.events().publish(
+            (symbol_short!("ADM_AUD"), symbol_short!("CFG_UPD")),
+            (
+                admin,
+                env.ledger().timestamp(),
+                symbol_short!("MAX_NOTE"),
+                length,
+            ),
+        );
+    }
+
     /// Admin-only function to set a custom weight for a specific task type.
     /// Allows per-task-type score increment configuration. Falls back to defaults if not set.
     ///
@@ -8383,5 +8431,71 @@ mod tests {
         assert_eq!(t0, symbol_short!("UPD_MAX"));
         let emitted_max: u32 = data.try_into_val(&env).unwrap();
         assert_eq!(emitted_max, 300);
+    }
+
+    // --- Issue #830: set_max_notes_length ---
+
+    #[test]
+    fn test_set_max_notes_length_updates_config() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (lifecycle, _, _, admin) = setup(&env, 0);
+
+        lifecycle.set_max_notes_length(&admin, &128);
+
+        let config = lifecycle.get_config();
+        assert_eq!(config.max_notes_length, 128);
+    }
+
+    #[test]
+    fn test_set_max_notes_length_zero_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (lifecycle, _, _, admin) = setup(&env, 0);
+
+        let result = lifecycle.try_set_max_notes_length(&admin, &0);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::InvalidConfig as u32,
+            ))),
+        );
+    }
+
+    #[test]
+    fn test_set_max_notes_length_non_admin_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (lifecycle, _, _, _admin) = setup(&env, 0);
+
+        let outsider = Address::generate(&env);
+        let result = lifecycle.try_set_max_notes_length(&outsider, &64);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::UnauthorizedAdmin as u32,
+            ))),
+        );
+    }
+
+    #[test]
+    fn test_set_max_notes_length_emits_event() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (lifecycle, _, _, admin) = setup(&env, 0);
+
+        lifecycle.set_max_notes_length(&admin, &512);
+
+        use soroban_sdk::TryIntoVal;
+        let events = env.events().all();
+        let found = events.iter().any(|(_, topics, data)| {
+            topics
+                .get(0)
+                .and_then(|v| v.try_into_val::<_, Symbol>(&env).ok())
+                .map(|s| s == symbol_short!("SET_NOTES"))
+                .unwrap_or(false)
+                && data.try_into_val::<_, u32>(&env).ok() == Some(512)
+        });
+        assert!(found, "SET_NOTES event not emitted");
     }
 }
