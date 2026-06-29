@@ -349,7 +349,7 @@ impl EngineerRegistry {
                 } else if env.ledger().timestamp() < e.expires_at {
                     CredentialStatus::Valid
                 } else {
-                    CredentialStatus::Expired
+                    CredentialStatus::HardExpired
                 }
             }
             None => CredentialStatus::NotFound,
@@ -380,7 +380,7 @@ impl EngineerRegistry {
                     } else if now < e.expires_at {
                         CredentialStatus::Valid
                     } else {
-                        CredentialStatus::Expired
+                        CredentialStatus::HardExpired
                     }
                 }
                 None => CredentialStatus::NotFound,
@@ -625,9 +625,6 @@ impl EngineerRegistry {
     /// - [`ContractError::AdminAlreadyInitialized`] if admin has already been initialized
     /// - [`ContractError::UnauthorizedAdmin`] if deployer is not the transaction invoker
     pub fn initialize_admin(env: Env, deployer: Address, admin: Address) {
-        if deployer != env.invoker() {
-            panic_with_error!(&env, ContractError::UnauthorizedAdmin);
-        }
         deployer.require_auth();
         if env.storage().instance().has(&admin_key()) {
             panic_with_error!(&env, ContractError::AdminAlreadyInitialized);
@@ -3447,10 +3444,6 @@ mod tests {
 
     #[test]
     fn test_batch_verify_engineers_all_valid() {
-    // --- #752: upgrade timelock tests ---
-
-    #[test]
-    fn test_execute_upgrade_before_timelock_fails() {
         let env = Env::default();
         env.mock_all_auths();
         let (client, admin) = setup(&env);
@@ -3474,8 +3467,14 @@ mod tests {
         assert!(results.get(2).unwrap());
     }
 
+    // --- #752: upgrade timelock tests ---
+
     #[test]
-    fn test_batch_verify_engineers_mixed() {
+    fn test_execute_upgrade_before_timelock_fails() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin) = setup(&env);
+
         let hash = BytesN::from_array(&env, &[0xabu8; 32]);
         client.propose_upgrade(&admin, &hash);
 
@@ -3489,7 +3488,7 @@ mod tests {
     }
 
     #[test]
-    fn test_execute_upgrade_after_timelock_succeeds() {
+    fn test_batch_verify_engineers_mixed() {
         let env = Env::default();
         env.mock_all_auths();
         let (client, admin) = setup(&env);
@@ -3518,7 +3517,11 @@ mod tests {
     }
 
     #[test]
-    fn test_batch_verify_engineers_all_invalid() {
+    fn test_execute_upgrade_after_timelock_succeeds() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin) = setup(&env);
+
         let hash = BytesN::from_array(&env, &[0xabu8; 32]);
         client.propose_upgrade(&admin, &hash);
 
@@ -3529,7 +3532,7 @@ mod tests {
     }
 
     #[test]
-    fn test_execute_upgrade_without_proposal_fails() {
+    fn test_batch_verify_engineers_all_invalid() {
         let env = Env::default();
         env.mock_all_auths();
         let (client, admin) = setup(&env);
@@ -3553,6 +3556,14 @@ mod tests {
         assert!(!results.get(0).unwrap(), "revoked engineer must be false");
         assert!(!results.get(1).unwrap(), "revoked engineer must be false");
         assert!(!results.get(2).unwrap(), "never-registered engineer must be false");
+    }
+
+    #[test]
+    fn test_execute_upgrade_without_proposal_fails() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin) = setup(&env);
+
         let result = client.try_execute_upgrade(&admin);
         assert_eq!(
             result,
