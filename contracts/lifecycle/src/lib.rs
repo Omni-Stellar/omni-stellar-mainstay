@@ -7,7 +7,7 @@ mod types;
 use crate::errors::ContractError;
 use crate::scoring::{apply_decay, compute_decay, get_task_weight, score_history_push};
 use crate::types::{
-    BatchRecord, Config, DataKey, MaintenanceRecord, ScoreEntry, TimelockProposal,
+    BatchRecord, Config, DataKey, HealthSnapshot, MaintenanceRecord, ScoreEntry, TimelockProposal,
 };
 use shared::validation::require_non_empty_vec;
 use soroban_sdk::{
@@ -86,6 +86,11 @@ fn frozen_key(asset_id: u64) -> (Symbol, u64) {
 
 fn frozen_score_key(asset_id: u64) -> (Symbol, u64) {
     (symbol_short!("FRZ_SCR"), asset_id)
+}
+
+fn health_snapshot_key(asset_id: u64) -> (Symbol, u64) {
+    (symbol_short!("HLTH_SNP"), asset_id)
+}
 fn revoke_eng_timelock_key(asset_id: u64, engineer: &Address) -> (Symbol, u64, Address) {
     (symbol_short!("RVK_TL"), asset_id, engineer.clone())
 }
@@ -2461,6 +2466,86 @@ impl Lifecycle {
             panic_with_error!(&env, ContractError::InvalidConfig);
         }
         Self::is_collateral_eligible(env, asset_id)
+    }
+
+    /// Capture a point-in-time health snapshot for an asset.
+    ///
+    /// Anyone may call this. The snapshot persists independently of maintenance
+    /// history so lenders can verify condition even after TTL-driven pruning.
+    ///
+    /// # Arguments
+    /// * `asset_id` - The asset to snapshot
+    ///
+    /// # Panics
+    /// - [`ContractError::NotInitialized`] if contract has not been initialized
+    /// - [`ContractError::AssetNotFound`] if the asset does not exist
+    pub fn take_health_snapshot(env: Env, asset_id: u64) -> HealthSnapshot {
+        let asset_registry = get_asset_registry_addr(&env);
+        verify_asset_exists(&env, &asset_registry, &asset_id);
+
+        let score = {
+            let stored: u32 = env.storage().persistent().get(&score_key(asset_id)).unwrap_or(0);
+            let config: Config = env
+                .storage()
+                .persistent()
+                .get::<_, Config>(&CONFIG)
+                .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
+            let last_update: u64 = env
+                .storage()
+                .persistent()
+                .get(&last_update_key(asset_id))
+                .unwrap_or(0);
+            let elapsed = env.ledger().timestamp().saturating_sub(last_update);
+            let decay = (elapsed / config.decay_interval) as u32 * config.decay_rate;
+            stored.saturating_sub(decay)
+        };
+
+        let history: Vec<MaintenanceRecord> = env
+            .storage()
+            .persistent()
+            .get(&history_key(asset_id))
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let maintenance_count = history.len();
+        let last_service_date = history
+            .iter()
+            .map(|r| r.timestamp)
+            .fold(0u64, |acc, t| if t > acc { t } else { acc });
+
+        let snapshot = HealthSnapshot {
+            timestamp: env.ledger().timestamp(),
+            score,
+            maintenance_count,
+            last_service_date,
+        };
+
+        let key = health_snapshot_key(asset_id);
+        let mut snapshots: Vec<HealthSnapshot> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| Vec::new(&env));
+        snapshots.push_back(snapshot.clone());
+        env.storage().persistent().set(&key, &snapshots);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
+
+        snapshot
+    }
+
+    /// Return all stored health snapshots for an asset.
+    ///
+    /// # Arguments
+    /// * `asset_id` - The asset to query
+    ///
+    /// # Returns
+    /// Vec of [`HealthSnapshot`] in chronological order (oldest first).
+    pub fn get_health_snapshots(env: Env, asset_id: u64) -> Vec<HealthSnapshot> {
+        env.storage()
+            .persistent()
+            .get(&health_snapshot_key(asset_id))
+            .unwrap_or_else(|| Vec::new(&env))
     }
 }
 
@@ -8492,6 +8577,116 @@ mod tests {
         assert_eq!(emitted_max, 300);
     }
 
+    // --- Health Snapshot Tests ---
+
+    #[test]
+    fn test_take_health_snapshot_empty_history() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, _, _) = setup(&env, 0);
+        let (asset_id, _) = register_asset(&env, &asset_registry_client);
+
+        let snapshot = client.take_health_snapshot(&asset_id);
+
+        assert_eq!(snapshot.score, 0);
+        assert_eq!(snapshot.maintenance_count, 0);
+        assert_eq!(snapshot.last_service_date, 0);
+        assert_eq!(snapshot.timestamp, env.ledger().timestamp());
+    }
+
+    #[test]
+    fn test_take_health_snapshot_with_maintenance() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
+
+        client.submit_maintenance(
+            &asset_id,
+            &symbol_short!("OIL_CHG"),
+            &String::from_str(&env, "Oil change"),
+            &engineer,
+        );
+        client.submit_maintenance(
+            &asset_id,
+            &symbol_short!("FILTER"),
+            &String::from_str(&env, "Filter"),
+            &engineer,
+        );
+
+        let service_ts = env.ledger().timestamp();
+        let snapshot = client.take_health_snapshot(&asset_id);
+
+        assert!(snapshot.score > 0, "score should be positive after maintenance");
+        assert_eq!(snapshot.maintenance_count, 2);
+        assert_eq!(snapshot.last_service_date, service_ts);
+        assert_eq!(snapshot.timestamp, service_ts);
+    }
+
+    #[test]
+    fn test_get_health_snapshots_accumulates() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
+
+        client.submit_maintenance(
+            &asset_id,
+            &symbol_short!("OIL_CHG"),
+            &String::from_str(&env, "First service"),
+            &engineer,
+        );
+
+        client.take_health_snapshot(&asset_id);
+
+        env.ledger().with_mut(|li| li.timestamp += 1000);
+
+        client.submit_maintenance(
+            &asset_id,
+            &symbol_short!("FILTER"),
+            &String::from_str(&env, "Second service"),
+            &engineer,
+        );
+
+        client.take_health_snapshot(&asset_id);
+
+        let snapshots = client.get_health_snapshots(&asset_id);
+        assert_eq!(snapshots.len(), 2, "should have one snapshot per take_health_snapshot call");
+        assert!(
+            snapshots.get(1).unwrap().timestamp > snapshots.get(0).unwrap().timestamp,
+            "snapshots should be in chronological order"
+        );
+        assert_eq!(snapshots.get(1).unwrap().maintenance_count, 2);
+    }
+
+    #[test]
+    fn test_get_health_snapshots_empty_before_any_snapshot() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, _, _) = setup(&env, 0);
+        let (asset_id, _) = register_asset(&env, &asset_registry_client);
+
+        let snapshots = client.get_health_snapshots(&asset_id);
+        assert_eq!(snapshots.len(), 0);
+    }
+
+    #[test]
+    fn test_take_health_snapshot_nonexistent_asset_fails() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, _, _, _) = setup(&env, 0);
+
+        let result = client.try_take_health_snapshot(&999u64);
+        assert!(result.is_err(), "should error for unknown asset");
     // --- Deprecation: collateral score tests ---
 
     #[test]
