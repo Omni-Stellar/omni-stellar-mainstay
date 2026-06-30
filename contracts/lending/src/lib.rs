@@ -78,6 +78,7 @@ pub struct Loan {
     pub amount: u64,
     pub status: LoanStatus,
     pub deadline: u64,
+    pub id: u64,
 }
 
 #[contracttype]
@@ -91,6 +92,16 @@ pub struct Vouch {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Borrower {
     pub default_count: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Liquidation {
+    pub asset_id: u64,
+    pub lender: Address,
+    pub loan_id: u64,
+    pub initiated_at: u64,
+    pub completed: bool,
 }
 
 #[contracttype]
@@ -263,11 +274,17 @@ impl LendingContract {
         }
 
         let deadline = env.ledger().timestamp() + get_loan_duration(&env);
+        let loan_id_counter: u64 = env.storage().persistent().get(&symbol_short!("L_COUNT")).unwrap_or(0);
+        let new_loan_id = loan_id_counter + 1;
+        env.storage().persistent().set(&symbol_short!("L_COUNT"), &new_loan_id);
+        env.storage().persistent().set(&(symbol_short!("L_MAP"), new_loan_id), &borrower);
+
         let loan = Loan {
             borrower: borrower.clone(),
             amount,
             status: LoanStatus::Active,
             deadline,
+            id: new_loan_id,
         };
         env.storage().persistent().set(&key, &loan);
         extend_persistent_ttl(&env, &key);
@@ -477,6 +494,12 @@ impl LendingContract {
         loan.status = LoanStatus::Defaulted;
         env.storage().persistent().set(&key, &loan);
         extend_persistent_ttl(&env, &key);
+
+        let default_time = env.ledger().timestamp();
+        env.storage().persistent().set(&(symbol_short!("DEF_TIME"), borrower.clone()), &default_time);
+        env.storage()
+            .persistent()
+            .extend_ttl(&(symbol_short!("DEF_TIME"), borrower.clone()), TTL_THRESHOLD, TTL_TARGET);
 
         let borrower_key_val = borrower_key(&borrower);
         if let Some(mut borrower_record) = env
