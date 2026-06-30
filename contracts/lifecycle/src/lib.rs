@@ -9069,6 +9069,119 @@ mod tests {
         assert!(found, "SET_NOTES event not emitted");
     }
 
+    // --- Issue #770 ---
+
+    #[test]
+    fn test_batch_submit_fails_atomically_on_first_invalid_record() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
+
+        // Two valid records followed by one invalid record (unknown task type at index 2).
+        let mut records = Vec::new(&env);
+        records.push_back(BatchRecord {
+            task_type: symbol_short!("OIL_CHG"),
+            notes: String::from_str(&env, "Valid record 0"),
+        });
+        records.push_back(BatchRecord {
+            task_type: symbol_short!("INSPECT"),
+            notes: String::from_str(&env, "Valid record 1"),
+        });
+        records.push_back(BatchRecord {
+            task_type: symbol_short!("UNKNOWN"),
+            notes: String::from_str(&env, "Invalid task type at index 2"),
+        });
+
+        let result = client.try_batch_submit_maintenance(&asset_id, &records, &engineer);
+
+        // Batch panics at the invalid record (index 2) with InvalidTaskType.
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::InvalidTaskType as u32,
+            ))),
+        );
+
+        // Atomicity guarantee: no records written despite two valid records preceding the failure.
+        assert_eq!(
+            client.get_maintenance_history(&asset_id).len(),
+            0,
+            "history must be empty — batch must not write partial records",
+        );
+        assert_eq!(
+            client.get_collateral_score(&asset_id),
+            0,
+            "score must be unchanged after a failed batch",
+        );
+    }
+
+    // --- Issue #772 ---
+
+    #[test]
+    fn test_get_maintenance_history_page_25_records() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
+
+        // Submit 25 records in a single batch.
+        let mut records = Vec::new(&env);
+        for _ in 0..25u32 {
+            records.push_back(BatchRecord {
+                task_type: symbol_short!("OIL_CHG"),
+                notes: String::from_str(&env, "Maintenance record"),
+            });
+        }
+        client.batch_submit_maintenance(&asset_id, &records, &engineer);
+        assert_eq!(client.get_maintenance_history(&asset_id).len(), 25);
+
+        // Page 1: offset=0, limit=10 → records 0-9 (10 records).
+        let page1 = client.get_maintenance_history_page(&asset_id, &0, &10);
+        assert_eq!(page1.len(), 10, "page 1 must contain 10 records");
+
+        // Page 2: offset=10, limit=10 → records 10-19 (10 records).
+        let page2 = client.get_maintenance_history_page(&asset_id, &10, &10);
+        assert_eq!(page2.len(), 10, "page 2 must contain 10 records");
+
+        // Page 3: offset=20, limit=10 → records 20-24 (5 records, partial last page).
+        let page3 = client.get_maintenance_history_page(&asset_id, &20, &10);
+        assert_eq!(page3.len(), 5, "page 3 must contain the 5 remaining records");
+
+        // Page 4: offset=30 is beyond history length (25) → empty vec.
+        let page4 = client.get_maintenance_history_page(&asset_id, &30, &10);
+        assert_eq!(page4.len(), 0, "out-of-bounds offset must return an empty vec");
+
+        // Verify each page covers the correct slice of the full history.
+        let full = client.get_maintenance_history(&asset_id);
+        for i in 0..10u32 {
+            assert_eq!(
+                page1.get(i).unwrap().task_type,
+                full.get(i).unwrap().task_type,
+                "page1 record {} must match full history record {}",
+                i, i,
+            );
+            assert_eq!(
+                page2.get(i).unwrap().task_type,
+                full.get(10 + i).unwrap().task_type,
+                "page2 record {} must match full history record {}",
+                i, 10 + i,
+            );
+        }
+        for i in 0..5u32 {
+            assert_eq!(
+                page3.get(i).unwrap().task_type,
+                full.get(20 + i).unwrap().task_type,
+                "page3 record {} must match full history record {}",
+                i, 20 + i,
+            );
+        }
     // ── Multisig / quorum tests ───────────────────────────────────────────────
 
     #[test]
