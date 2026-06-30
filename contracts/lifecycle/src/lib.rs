@@ -1211,9 +1211,15 @@ impl Lifecycle {
             env.events().publish((EVENT_PRUNED,), (asset_id, pruned));
         }
 
-        // Verify asset exists
+        // Verify asset exists and is not decommissioned
         let asset_registry = get_asset_registry_addr(&env);
         verify_asset_exists(&env, &asset_registry, &asset_id);
+        let asset_client = asset_registry::AssetRegistryClient::new(&env, &asset_registry);
+        let status = asset_client.asset_status(&asset_id);
+        use asset_registry::AssetStatus;
+        if status == AssetStatus::Decommissioned {
+            panic_with_error!(&env, ContractError::AssetDecommissioned);
+        }
 
         // Cross-check engineer credential via registry. The lifecycle's
         // own trait declares `verify_engineer -> Option<bool>` so we keep
@@ -1605,7 +1611,62 @@ impl Lifecycle {
     ///
     /// # Panics
     /// - [`ContractError::NotInitialized`] if contract has not been initialized
-    pub fn decommission_notify(env: Env, asset_id: u64) {
+    /// Notify lifecycle contract of asset ownership transfer.
+    /// Called by asset-registry to clear engineer authorizations for the new owner.
+    ///
+    /// # Arguments
+    /// * `asset_id` - The unique identifier of the transferred asset
+    /// * `new_owner` - The address of the new asset owner
+    ///
+    /// # Panics
+    /// - [`ContractError::NotInitialized`] if contract has not been initialized
+    /// - [`ContractError::UnauthorizedOwner`] if asset owner doesn't match
+    pub fn transfer_notify(env: Env, asset_id: u64, new_owner: Address) {
+        let asset_registry = get_asset_registry_addr(&env);
+        asset_registry.require_auth();
+        env.storage()
+            .persistent()
+            .get::<_, Config>(&CONFIG)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
+
+        // Verify asset exists and is owned by new_owner (as verified by asset-registry)
+        verify_asset_exists(&env, &asset_registry, &asset_id);
+        let asset = asset_registry::AssetRegistryClient::new(&env, &asset_registry).get_asset(&asset_id);
+        if asset.owner != new_owner {
+            panic_with_error!(&env, ContractError::UnauthorizedOwner);
+        }
+
+        // Clear engineer authorizations for the asset
+        if let Some(history) = env
+            .storage()
+            .persistent()
+            .get::<_, Vec<MaintenanceRecord>>(&history_key(asset_id))
+        {
+            let mut cleared_engineers = Vec::new(&env);
+            for record in history.iter() {
+                let eng = record.engineer.clone();
+                let mut already_cleared = false;
+                for cleared in cleared_engineers.iter() {
+                    if cleared == eng {
+                        already_cleared = true;
+                        break;
+                    }
+                }
+                if !already_cleared {
+                    env.storage()
+                        .persistent()
+                        .remove(&engineer_auth_key(asset_id, &eng));
+                    cleared_engineers.push_back(eng);
+                }
+            }
+        }
+
+        env.events()
+            .publish((symbol_short!("XFER"), asset_id), new_owner);
+    }
+
+    /// Decommission notify for lifecycle contract.
+
         let asset_registry = get_asset_registry_addr(&env);
         asset_registry.require_auth();
         env.storage()
@@ -3253,6 +3314,64 @@ mod tests {
             result,
             Err(Ok(soroban_sdk::Error::from_contract_error(
                 ContractError::NotesTooLong as u32,
+            ))),
+        );
+    }
+
+    #[test]
+    fn test_submit_maintenance_rejects_empty_notes() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
+
+        let empty_notes = String::from_str(&env, "");
+
+        let result = client.try_submit_maintenance(
+            &asset_id,
+            &symbol_short!("OIL_CHG"),
+            &empty_notes,
+            &engineer,
+        );
+
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::NotesTooLong as u32,
+            ))),
+        );
+    }
+
+    #[test]
+    fn test_submit_maintenance_rejects_decommissioned_asset() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
+
+        // Decommission the asset
+        let admin = Address::generate(&env);
+        asset_registry_client.initialize_admin(&admin, &admin);
+        asset_registry_client.decommission_asset(&admin, &asset_id);
+
+        // Attempt to submit maintenance for decommissioned asset should fail
+        let result = client.try_submit_maintenance(
+            &asset_id,
+            &symbol_short!("OIL_CHG"),
+            &String::from_str(&env, "Should be rejected"),
+            &engineer,
+        );
+
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::AssetDecommissioned as u32,
             ))),
         );
     }

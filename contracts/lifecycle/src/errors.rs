@@ -30,6 +30,8 @@ pub enum ContractError {
     NotesTooLong = 20,
     /// Asset score is frozen due to decommission; decay and mutation are blocked.
     ScoreFrozen = 21,
+    /// Asset is decommissioned and cannot accept maintenance records.
+    AssetDecommissioned = 22,
     /// Fewer valid signers were provided than the configured admin_threshold requires.
     InsufficientSigners = 22,
 }
