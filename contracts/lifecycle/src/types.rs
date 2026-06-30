@@ -1,6 +1,6 @@
 #![no_std]
 
-use soroban_sdk::{contracttype, Address, String, Symbol, Map};
+use soroban_sdk::{contracttype, Address, Map, String, Symbol};
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -75,4 +75,5 @@ pub enum DataKey {
     EngineerAuth(u64, Address),
     Timelock(Symbol),
     HealthSnapshots(u64),
+    CollateralValuationHistory(u64),
 }

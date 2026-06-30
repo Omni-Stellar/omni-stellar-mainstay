@@ -1,42 +1,80 @@
 #![no_std]
 
 use crate::errors::ContractError;
-use crate::types::{Config, MaintenanceRecord, ScoreEntry};
+use crate::types::{Config, DataKey, MaintenanceRecord, ScoreEntry};
 use soroban_sdk::{panic_with_error, symbol_short, Env, Symbol, Vec};
 
-pub fn score_history_push(env: &Env, asset_id: u64, entry: ScoreEntry, max_history: u32) {
-    let key = super::score_history_key(asset_id);
-    let mut history: Vec<ScoreEntry> = env
-        .storage()
-        .persistent()
-        .get(&key)
-        .unwrap_or_else(|| Vec::new(env));
+fn push_deduped<T: Clone>(
+    env: &Env,
+    key: &impl soroban_sdk::IntoVal<Env, soroban_sdk::Val>,
+    entry: T,
+    timestamp_of: impl Fn(&T) -> u64,
+    max_history: u32,
+) {
+    pub fn score_history_push(env: &Env, asset_id: u64, entry: ScoreEntry, max_history: u32) {
+        let key = super::score_history_key(asset_id);
+        let mut history: Vec<ScoreEntry> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| Vec::new(env));
 
-    // Deduplicate: if the last entry shares the same ledger timestamp, update it in-place
-    // instead of appending. This prevents multiple submissions in the same ledger from
-    // inflating history length and skewing trend analysis.
-    let last_idx = history.len().saturating_sub(1);
-    if !history.is_empty() {
-        let last = history.get(last_idx).unwrap();
-        if last.timestamp == entry.timestamp {
-            history.set(last_idx, entry);
-            env.storage().persistent().set(&key, &history);
-            env.storage()
-                .persistent()
-                .extend_ttl(&key, super::TTL_THRESHOLD, super::TTL_TARGET);
-            return;
+        // Deduplicate: if the last entry shares the same ledger timestamp, update it in-place
+        // instead of appending. This prevents multiple submissions in the same ledger from
+        // inflating history length and skewing trend analysis.
+        let last_idx = history.len().saturating_sub(1);
+        if !history.is_empty() {
+            let last = history.get(last_idx).unwrap();
+            if last.timestamp == entry.timestamp {
+                history.set(last_idx, entry);
+                env.storage().persistent().set(&key, &history);
+                env.storage()
+                    .persistent()
+                    .extend_ttl(&key, super::TTL_THRESHOLD, super::TTL_TARGET);
+                return;
+            }
         }
+
+        if max_history > 0 && history.len() >= max_history {
+            history.remove(0);
+        }
+        history.push_back(entry);
+        env.storage().persistent().set(&key, &history);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, super::TTL_THRESHOLD, super::TTL_TARGET);
     }
 
-    if max_history > 0 && history.len() >= max_history {
-        history.remove(0);
+    pub fn valuation_history_push(env: &Env, asset_id: u64, timestamp: u64, value: u64, max_history: u32) {
+        let key = DataKey::CollateralValuationHistory(asset_id);
+        let mut history: Vec<(u64, u64)> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| Vec::new(env));
+
+        let last_idx = history.len().saturating_sub(1);
+        if !history.is_empty() {
+            let last = history.get(last_idx).unwrap();
+            if last.0 == timestamp {
+                history.set(last_idx, (timestamp, value));
+                env.storage().persistent().set(&key, &history);
+                env.storage()
+                    .persistent()
+                    .extend_ttl(&key, super::TTL_THRESHOLD, super::TTL_TARGET);
+                return;
+            }
+        }
+
+        if max_history > 0 && history.len() >= max_history {
+            history.remove(0);
+        }
+        history.push_back((timestamp, value));
+        env.storage().persistent().set(&key, &history);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, super::TTL_THRESHOLD, super::TTL_TARGET);
     }
-    history.push_back(entry);
-    env.storage().persistent().set(&key, &history);
-    env.storage()
-        .persistent()
-        .extend_ttl(&key, super::TTL_THRESHOLD, super::TTL_TARGET);
-}
 
 pub fn get_task_weight(env: &Env, task_type: &Symbol, config: &Config) -> u32 {
     // First check if task type has a configured weight
@@ -118,7 +156,11 @@ pub fn apply_decay(
         .unwrap_or(0u32);
 
     if current_score == 0 {
-        if env.storage().persistent().has(&super::last_update_key(asset_id)) {
+        if env
+            .storage()
+            .persistent()
+            .has(&super::last_update_key(asset_id))
+        {
             env.storage().persistent().extend_ttl(
                 &super::last_update_key(asset_id),
                 super::TTL_THRESHOLD,
@@ -144,9 +186,11 @@ pub fn apply_decay(
     let time_elapsed = current_time.saturating_sub(last_update);
     let decay_intervals = time_elapsed / config.decay_interval;
     if decay_intervals == 0 && !update_on_zero_interval {
-        env.storage()
-            .persistent()
-            .extend_ttl(&super::score_key(asset_id), super::TTL_THRESHOLD, super::TTL_TARGET);
+        env.storage().persistent().extend_ttl(
+            &super::score_key(asset_id),
+            super::TTL_THRESHOLD,
+            super::TTL_TARGET,
+        );
         env.storage().persistent().extend_ttl(
             &super::last_update_key(asset_id),
             super::TTL_THRESHOLD,
@@ -161,15 +205,20 @@ pub fn apply_decay(
     env.storage()
         .persistent()
         .set(&super::score_key(asset_id), &new_score);
-    env.storage()
-        .persistent()
-        .extend_ttl(&super::score_key(asset_id), super::TTL_THRESHOLD, super::TTL_TARGET);
+    env.storage().persistent().extend_ttl(
+        &super::score_key(asset_id),
+        super::TTL_THRESHOLD,
+        super::TTL_TARGET,
+    );
     env.storage()
         .persistent()
         .set(&super::last_update_key(asset_id), &current_time);
-    env.storage()
-        .persistent()
-        .extend_ttl(&super::last_update_key(asset_id), super::TTL_THRESHOLD, super::TTL_TARGET);
+    env.storage().persistent().extend_ttl(
+        &super::last_update_key(asset_id),
+        super::TTL_THRESHOLD,
+        super::TTL_TARGET,
+    );
+    valuation_history_push(env, asset_id, current_time, new_score as u64, max_history);
 
     score_history_push(
         env,
