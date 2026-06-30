@@ -82,6 +82,14 @@ pub struct MetadataHistoryEntry {
     pub updated_at: u64,
     /// Soft lifecycle status set by the owner. Defaults to `Active` on registration.
     pub deprecation_status: DeprecationStatus,
+    /// Whether this asset is currently locked as collateral under a lien.
+    /// While `true`, ownership transfers are blocked.
+    pub is_locked: bool,
+    /// The lending contract address that placed the lien, if any.
+    pub lender: Option<Address>,
+    /// The loan ID associated with the lien, used to verify the correct loan
+    /// releases the lock on repayment.
+    pub loan_id: Option<u64>,
 }
 
 #[contracttype]
@@ -125,6 +133,14 @@ pub struct OwnerPage {
 pub struct TimelockProposal {
     pub proposed_at: u64,
     pub executed: bool,
+}
+
+/// A pending multi-signature ownership transfer awaiting acceptance by `new_owner`.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingTransfer {
+    pub new_owner: Address,
+    pub initiated_at: u64,
 }
 
 #[contracttype]
@@ -188,11 +204,19 @@ pub struct SearchPage {
 const ASSET_COUNT: Symbol = symbol_short!("A_COUNT");
 const PAUSED_KEY: Symbol = symbol_short!("PAUSED");
 const TIMELOCK_DELAY_SECS: u64 = 48 * 60 * 60;
+/// Default window for a proposed new owner to accept an ownership transfer.
+const TRANSFER_TIMEOUT_SECS: u64 = 7 * 24 * 60 * 60;
 
 const ADMIN_KEY: Symbol = symbol_short!("ADMIN");
 const ASSET_TYPE_PREFIX: Symbol = symbol_short!("AST_TYPE");
 const PENDING_ADMIN_KEY: Symbol = symbol_short!("PADMIN");
 const DECOMM_PREFIX: Symbol = symbol_short!("DECOMM");
+const LIFECYCLE_KEY: Symbol = symbol_short!("LIFECYCLE");
+
+/// Storage key for the authorized lending contract address.
+/// Only the contract stored under this key may call `lock_asset_as_collateral`
+/// and `unlock_asset_from_collateral`.
+const LENDING_CONTRACT_KEY: Symbol = symbol_short!("LEND_CTR");
 
 /// Maximum number of assets that may be registered in a single batch call.
 const MAX_BATCH_SIZE: u32 = 50;
@@ -223,6 +247,12 @@ fn require_timelock_ready(env: &Env, op: Symbol, asset_id: u64) {
     if proposal.executed {
         panic_with_error!(env, ContractError::ProposalNotFound);
     }
+    // #795: Compare using ledger timestamp (Unix seconds), NOT ledger sequence number.
+    // TIMELOCK_DELAY_SECS is expressed in seconds; env.ledger().timestamp() returns
+    // Unix epoch seconds — they are directly comparable.  env.ledger().sequence()
+    // returns the ledger number (currently ~30M on mainnet) and must NOT be used here:
+    // the comparison would be either instant (delay << sequence) or centuries long.
+    if env.ledger().timestamp().saturating_sub(proposal.proposed_at) < TIMELOCK_DELAY_SECS {
     if env
         .ledger()
         .timestamp()
@@ -251,6 +281,11 @@ fn require_global_timelock_ready(env: &Env, op: Symbol) {
     if proposal.executed {
         panic_with_error!(env, ContractError::ProposalNotFound);
     }
+    // #795: Compare using ledger timestamp (Unix seconds), NOT ledger sequence number.
+    // TIMELOCK_DELAY_SECS is expressed in seconds; env.ledger().timestamp() returns
+    // Unix epoch seconds — they are directly comparable.  env.ledger().sequence()
+    // returns the ledger number and must NOT be used here.
+    if env.ledger().timestamp().saturating_sub(proposal.proposed_at) < TIMELOCK_DELAY_SECS {
     if env
         .ledger()
         .timestamp()
@@ -656,6 +691,9 @@ impl AssetRegistry {
             metadata_updated_at: env.ledger().timestamp(),
             metadata_version: 0,
             deprecation_status: DeprecationStatus::Active,
+            is_locked: false,
+            lender: None,
+            loan_id: None,
         };
         env.storage().persistent().set(&asset_key(id), &asset);
         extend_persistent_ttl(&env, &asset_key(id));
@@ -769,6 +807,9 @@ impl AssetRegistry {
                 metadata_updated_at: env.ledger().timestamp(),
                 metadata_version: 0,
                 deprecation_status: DeprecationStatus::Active,
+                is_locked: false,
+                lender: None,
+                loan_id: None,
             };
 
             env.storage().persistent().set(&asset_key(id), &asset);
@@ -858,7 +899,18 @@ impl AssetRegistry {
         asset
     }
 
-    /// Returns true if an asset with the given ID exists, false otherwise.
+    /// Check whether an asset with the given ID is present in the registry.
+    ///
+    /// This is a lightweight existence check that reads a single persistent storage
+    /// entry and does **not** verify the asset's deprecation or decommission status.
+    /// Use [`get_asset`] if you need the full asset record, or [`asset_status`] if
+    /// you need operational state.
+    ///
+    /// # Arguments
+    /// * `asset_id` - The unique identifier of the asset to check
+    ///
+    /// # Returns
+    /// `true` if a record for `asset_id` exists in persistent storage; `false` otherwise
     pub fn asset_exists(env: Env, asset_id: u64) -> bool {
         env.storage().persistent().has(&asset_key(asset_id))
     }
@@ -913,7 +965,20 @@ impl AssetRegistry {
         AssetStatus::Active
     }
 
-    /// Returns all asset IDs owned by the given address.
+    /// Return all asset IDs currently owned by the given address.
+    ///
+    /// Uses the owner-to-assets index maintained by [`register_asset`] and
+    /// [`transfer_asset`]. The list is updated on every registration and transfer
+    /// so it reflects the owner's current portfolio.
+    ///
+    /// For owners with large portfolios that may exceed return-data limits, prefer
+    /// the paginated variant [`get_assets_by_owner_paginated`].
+    ///
+    /// # Arguments
+    /// * `owner` - The address of the asset owner to query
+    ///
+    /// # Returns
+    /// A `Vec<u64>` of asset IDs owned by `owner` (empty vec if none)
     pub fn get_assets_by_owner(env: Env, owner: Address) -> Vec<u64> {
         let key = owner_index_key(&owner);
         let ids: Vec<u64> = env
@@ -1056,6 +1121,21 @@ impl AssetRegistry {
         env.storage().persistent().get(&ASSET_COUNT).unwrap_or(0)
     }
 
+    /// Return all asset IDs that have been registered with the given type symbol.
+    ///
+    /// Uses the type-to-assets index maintained by [`register_asset`] and updated
+    /// on registration and deregistration. The returned list may include deprecated or
+    /// decommissioned assets; callers that need only active assets should filter by
+    /// [`asset_status`] after retrieval.
+    ///
+    /// For large fleets, prefer the paginated variant [`get_assets_by_type_paginated`]
+    /// to avoid exceeding Soroban's return-data limits.
+    ///
+    /// # Arguments
+    /// * `asset_type` - The symbol representing the asset type (e.g., `symbol_short!("GENSET")`)
+    ///
+    /// # Returns
+    /// A `Vec<u64>` of asset IDs of the requested type (empty vec if none)
     /// Get the total number of registered assets.
     /// Useful for analytics dashboards and DeFi protocol integrations.
     ///
@@ -1265,6 +1345,36 @@ impl AssetRegistry {
         env.storage()
             .instance()
             .get(&ADMIN_KEY)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized))
+    }
+
+    /// Set the lifecycle contract address for cross-contract notifications.
+    /// Only the admin can set this.
+    ///
+    /// # Arguments
+    /// * `admin` - The administrator making the update
+    /// * `lifecycle_addr` - The address of the lifecycle contract
+    ///
+    /// # Panics
+    /// - [`ContractError::UnauthorizedAdmin`] if caller is not the admin
+    pub fn set_lifecycle_contract(env: Env, admin: Address, lifecycle_addr: Address) {
+        admin.require_auth();
+        let stored_admin: Address = Self::get_admin(env.clone());
+        if stored_admin != admin {
+            panic_with_error!(&env, ContractError::UnauthorizedAdmin);
+        }
+        env.storage().instance().set(&LIFECYCLE_KEY, &lifecycle_addr);
+        env.storage().instance().extend_ttl(518400, 518400);
+    }
+
+    /// Get the configured lifecycle contract address.
+    ///
+    /// # Returns
+    /// The address of the lifecycle contract, or panics if not set
+    pub fn get_lifecycle_contract(env: Env) -> Address {
+        env.storage()
+            .instance()
+            .get(&LIFECYCLE_KEY)
             .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized))
     }
 
@@ -1585,6 +1695,11 @@ impl AssetRegistry {
             panic_with_error!(&env, ContractError::SameOwner);
         }
 
+        // Block transfers while the asset is locked as collateral under a lien.
+        if asset.is_locked {
+            panic_with_error!(&env, ContractError::AssetLocked);
+        }
+
         // Move dedup key to new owner
         let hash: BytesN<32> = env
             .crypto()
@@ -1608,6 +1723,132 @@ impl AssetRegistry {
 
         env.events().publish(
             (symbol_short!("TRANSFER"), asset_id),
+            (current_owner, new_owner, env.ledger().timestamp()),
+        );
+    }
+
+    /// Initiate a multi-signature ownership transfer (step 1 of 2).
+    /// Only the current owner can initiate. The proposed `new_owner` has
+    /// `TRANSFER_TIMEOUT_SECS` (7 days) to accept via [`Self::accept_ownership_transfer`]
+    /// before the proposal expires.
+    ///
+    /// # Arguments
+    /// * `asset_id` - The unique identifier of the asset to transfer
+    /// * `new_owner` - The address proposed as the new owner
+    ///
+    /// # Panics
+    /// - [`ContractError::AssetNotFound`] if no asset exists with the given ID
+    /// - [`ContractError::SameOwner`] if `new_owner` is already the current owner
+    /// - [`ContractError::TransferAlreadyPending`] if an unexpired transfer is already pending
+    pub fn initiate_ownership_transfer(env: Env, asset_id: u64, new_owner: Address) {
+        ensure_not_paused(&env);
+
+        let asset: Asset = env
+            .storage()
+            .persistent()
+            .get(&asset_key(asset_id))
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::AssetNotFound));
+
+        asset.owner.require_auth();
+
+        if asset.owner == new_owner {
+            panic_with_error!(&env, ContractError::SameOwner);
+        }
+
+        let key = pending_transfer_key(asset_id);
+        if let Some(existing) = env.storage().persistent().get::<_, PendingTransfer>(&key) {
+            if env.ledger().timestamp().saturating_sub(existing.initiated_at) < TRANSFER_TIMEOUT_SECS {
+                panic_with_error!(&env, ContractError::TransferAlreadyPending);
+            }
+        }
+
+        let pending = PendingTransfer {
+            new_owner: new_owner.clone(),
+            initiated_at: env.ledger().timestamp(),
+        };
+        env.storage().persistent().set(&key, &pending);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
+
+        env.events().publish(
+            (symbol_short!("OWN_INIT"), asset_id),
+            (asset.owner, new_owner, env.ledger().timestamp()),
+        );
+    }
+
+    /// Accept a pending ownership transfer (step 2 of 2). Only the proposed new owner
+    /// can accept, and only within `TRANSFER_TIMEOUT_SECS` (7 days) of initiation.
+    ///
+    /// # Arguments
+    /// * `asset_id` - The unique identifier of the asset whose transfer is being accepted
+    ///
+    /// # Panics
+    /// - [`ContractError::NoPendingTransfer`] if no transfer is pending for this asset
+    /// - [`ContractError::TransferExpired`] if the acceptance window has elapsed
+    /// - [`ContractError::AssetNotFound`] if no asset exists with the given ID
+    pub fn accept_ownership_transfer(env: Env, asset_id: u64) {
+        ensure_not_paused(&env);
+
+        let key = pending_transfer_key(asset_id);
+        let pending: PendingTransfer = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::NoPendingTransfer));
+
+        if env.ledger().timestamp().saturating_sub(pending.initiated_at) >= TRANSFER_TIMEOUT_SECS {
+            env.storage().persistent().remove(&key);
+            panic_with_error!(&env, ContractError::TransferExpired);
+        }
+
+        pending.new_owner.require_auth();
+
+        let mut asset: Asset = env
+            .storage()
+            .persistent()
+            .get(&asset_key(asset_id))
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::AssetNotFound));
+
+        let current_owner = asset.owner.clone();
+        let new_owner = pending.new_owner.clone();
+
+        // Move dedup key to new owner
+        let hash: BytesN<32> = env
+            .crypto()
+            .sha256(&asset.metadata.clone().to_xdr(&env))
+            .into();
+        env.storage()
+            .persistent()
+            .remove(&dedup_key(&current_owner, &asset.asset_type, &hash));
+        env.storage()
+            .persistent()
+            .set(&dedup_key(&new_owner, &asset.asset_type, &hash), &asset_id);
+        env.storage().persistent().extend_ttl(
+            &dedup_key(&new_owner, &asset.asset_type, &hash),
+            TTL_THRESHOLD,
+            TTL_TARGET,
+        );
+
+        // Move owner index entry
+        owner_index_remove(&env, &current_owner, asset_id);
+        owner_index_add(&env, &new_owner, asset_id);
+
+        asset.owner = new_owner.clone();
+        env.storage().persistent().set(&asset_key(asset_id), &asset);
+        env.storage()
+            .persistent()
+            .extend_ttl(&asset_key(asset_id), TTL_THRESHOLD, TTL_TARGET);
+
+        // Notify lifecycle contract to clear engineer authorizations for the asset
+        if let Ok(lifecycle_addr) = env.storage().instance().get::<_, Address>(&LIFECYCLE_KEY) {
+            let lifecycle_client = lifecycle::LifecycleClient::new(&env, &lifecycle_addr);
+            lifecycle_client.transfer_notify(&asset_id, &new_owner);
+        }
+        env.storage().persistent().remove(&key);
+
+        env.events().publish(
+            (symbol_short!("OWN_DONE"), asset_id),
             (current_owner, new_owner, env.ledger().timestamp()),
         );
     }
@@ -1701,6 +1942,7 @@ impl AssetRegistry {
         extend_persistent_ttl(&env, &reason_key);
 
         env.events().publish(
+            (symbol_short!("DEPRECATD"), asset_id),
             (symbol_short!("DEPRCATED"), asset_id),
             (symbol_short!("DEPR"), asset_id),
             (owner, reason, env.ledger().timestamp()),
@@ -2138,8 +2380,21 @@ fn string_contains(env: &Env, haystack: &String, needle: &String) -> bool {
     false
 }
 
+// Minimal client interface for cross-contract call to Lifecycle
+mod lifecycle {
+    use soroban_sdk::{contractclient, Address, Env, Symbol, String};
+
+    #[allow(dead_code)]
+    #[contractclient(name = "LifecycleClient")]
+    pub trait Lifecycle {
+        fn transfer_notify(env: Env, asset_id: u64, new_owner: Address);
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    extern crate std;
+    use std::format;
     use super::*;
     use soroban_sdk::testutils::storage::Instance as _;
     use soroban_sdk::testutils::storage::Persistent;
@@ -3156,6 +3411,214 @@ mod tests {
 
         // env.events().all() reflects only the most recent contract call
         assert_eq!(env.events().all().len(), 1);
+    }
+
+    #[test]
+    fn test_ownership_transfer_initiate_and_accept() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize_admin(&admin, &admin);
+        client.add_asset_type(&admin, &symbol_short!("GENSET"));
+
+        let owner = Address::generate(&env);
+        let new_owner = Address::generate(&env);
+        let id = client.register_asset(
+            &symbol_short!("GENSET"),
+            &String::from_str(&env, "CAT-3516"),
+            &unique_serial(&env),
+            &owner,
+        );
+
+        client.initiate_ownership_transfer(&id, &new_owner);
+        // Ownership has not changed yet — it only changes on acceptance.
+        assert_eq!(client.get_asset(&id).owner, owner);
+
+        client.accept_ownership_transfer(&id);
+        assert_eq!(client.get_asset(&id).owner, new_owner);
+    }
+
+    #[test]
+    fn test_ownership_transfer_emits_events() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize_admin(&admin, &admin);
+        client.add_asset_type(&admin, &symbol_short!("GENSET"));
+
+        let owner = Address::generate(&env);
+        let new_owner = Address::generate(&env);
+        let id = client.register_asset(
+            &symbol_short!("GENSET"),
+            &String::from_str(&env, "CAT-3516"),
+            &unique_serial(&env),
+            &owner,
+        );
+
+        client.initiate_ownership_transfer(&id, &new_owner);
+        assert_eq!(env.events().all().len(), 1);
+
+        client.accept_ownership_transfer(&id);
+        assert_eq!(env.events().all().len(), 1);
+    }
+
+    #[test]
+    fn test_ownership_transfer_same_owner_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize_admin(&admin, &admin);
+        client.add_asset_type(&admin, &symbol_short!("GENSET"));
+
+        let owner = Address::generate(&env);
+        let id = client.register_asset(
+            &symbol_short!("GENSET"),
+            &String::from_str(&env, "CAT-3516"),
+            &unique_serial(&env),
+            &owner,
+        );
+
+        let result = client.try_initiate_ownership_transfer(&id, &owner);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::SameOwner as u32,
+            ))),
+        );
+    }
+
+    #[test]
+    fn test_ownership_transfer_already_pending_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize_admin(&admin, &admin);
+        client.add_asset_type(&admin, &symbol_short!("GENSET"));
+
+        let owner = Address::generate(&env);
+        let new_owner = Address::generate(&env);
+        let other_owner = Address::generate(&env);
+        let id = client.register_asset(
+            &symbol_short!("GENSET"),
+            &String::from_str(&env, "CAT-3516"),
+            &unique_serial(&env),
+            &owner,
+        );
+
+        client.initiate_ownership_transfer(&id, &new_owner);
+        let result = client.try_initiate_ownership_transfer(&id, &other_owner);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::TransferAlreadyPending as u32,
+            ))),
+        );
+    }
+
+    #[test]
+    fn test_ownership_transfer_accept_without_pending_fails() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize_admin(&admin, &admin);
+        client.add_asset_type(&admin, &symbol_short!("GENSET"));
+
+        let owner = Address::generate(&env);
+        let id = client.register_asset(
+            &symbol_short!("GENSET"),
+            &String::from_str(&env, "CAT-3516"),
+            &unique_serial(&env),
+            &owner,
+        );
+
+        let result = client.try_accept_ownership_transfer(&id);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::NoPendingTransfer as u32,
+            ))),
+        );
+    }
+
+    #[test]
+    fn test_ownership_transfer_timeout_expires() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize_admin(&admin, &admin);
+        client.add_asset_type(&admin, &symbol_short!("GENSET"));
+
+        let owner = Address::generate(&env);
+        let new_owner = Address::generate(&env);
+        let id = client.register_asset(
+            &symbol_short!("GENSET"),
+            &String::from_str(&env, "CAT-3516"),
+            &unique_serial(&env),
+            &owner,
+        );
+
+        client.initiate_ownership_transfer(&id, &new_owner);
+
+        // Advance the ledger past the 7-day acceptance window.
+        env.ledger()
+            .with_mut(|li| li.timestamp += TRANSFER_TIMEOUT_SECS);
+
+        let result = client.try_accept_ownership_transfer(&id);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::TransferExpired as u32,
+            ))),
+        );
+
+        // Ownership is unchanged after expiry.
+        assert_eq!(client.get_asset(&id).owner, owner);
+
+        // A new transfer can be initiated after the old one expired.
+        client.initiate_ownership_transfer(&id, &new_owner);
+        client.accept_ownership_transfer(&id);
+        assert_eq!(client.get_asset(&id).owner, new_owner);
+    }
+
+    #[test]
+    fn test_ownership_transfer_updates_dedup_so_old_owner_can_reregister() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize_admin(&admin, &admin);
+        client.add_asset_type(&admin, &symbol_short!("GENSET"));
+
+        let owner = Address::generate(&env);
+        let new_owner = Address::generate(&env);
+        let metadata = String::from_str(&env, "CAT-3516");
+
+        let id = client.register_asset(&symbol_short!("GENSET"), &metadata, &unique_serial(&env), &owner);
+        client.initiate_ownership_transfer(&id, &new_owner);
+        client.accept_ownership_transfer(&id);
+
+        let id2 = client.register_asset(&symbol_short!("GENSET"), &metadata, &unique_serial(&env), &owner);
+        assert_ne!(id, id2);
     }
 
     #[test]
@@ -5985,6 +6448,7 @@ mod tests {
             // Register second asset, count should be 2
             client.register_asset(
                 &symbol_short!("GENSET"),
+                &String::from_str(&env, &format!("Generator {i}")),
                 &String::from_str(&env, "Generator 2"),
                 &unique_serial(&env),
                 &owner,
@@ -6065,6 +6529,7 @@ mod tests {
 
             client.register_asset(
                 &symbol_short!("GENSET"),
+                &String::from_str(&env, &format!("Generator {i}")),
                 &String::from_str(&env, "Generator 0"),
                 &unique_serial(&env),
                 &owner,
@@ -6269,6 +6734,12 @@ mod tests {
             let admin = Address::generate(&env);
             client.initialize_admin(&admin, &admin);
 
+        let events = env.events().all();
+        use soroban_sdk::TryIntoVal;
+        let prop_event = events.iter().find(|(_, topics, _)| {
+            if let Some(val) = topics.get(0) {
+                if let Ok(s) = TryIntoVal::<_, Symbol>::try_into_val(&val, &env) {
+                    return s == symbol_short!("PROP_UPG");
             let hash = BytesN::from_array(&env, &[0xabu8; 32]);
             client.propose_upgrade(&admin, &hash);
 
@@ -6304,6 +6775,34 @@ mod tests {
             env.ledger().set_timestamp(base + TIMELOCK_DELAY_SECS + 1);
             client.execute_upgrade(&admin);
 
+        let events = env.events().all();
+        use soroban_sdk::TryIntoVal;
+        let upgrade_event = events.iter().find(|(_, topics, _)| {
+            if let Some(val) = topics.get(0) {
+                if let Ok(s) = TryIntoVal::<_, Symbol>::try_into_val(&val, &env) {
+                    return s == symbol_short!("UPGRADE");
+                }
+            }
+            false
+        });
+        assert!(upgrade_event.is_some(), "UPGRADE event must be emitted on execute_upgrade");
+        let (_, _, data) = upgrade_event.unwrap();
+        let emitted_hash: BytesN<32> = data.try_into_val(&env).unwrap();
+        assert_eq!(emitted_hash, hash);
+    }
+
+    #[test]
+    fn test_get_assets_by_type_paginated_total_matches_across_pages() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, owner) = setup_with_types_for_pagination(&env);
+
+        for i in 0..12u32 {
+            client.register_asset(
+                &symbol_short!("GENSET"),
+                &String::from_str(&env, &format!("Generator {i}")),
+                &unique_serial(&env),
+                &owner,
             let events = env.events().all();
             use soroban_sdk::TryIntoVal;
             let upgrade_event = events.iter().find(|(_, topics, _)| {
@@ -6435,6 +6934,7 @@ mod tests {
             &soroban_sdk::BytesN::from_array(&env, &[1u8; 32]),
             &issuer,
             &31_536_000u64,
+            &None,
         );
         lc_client.authorize_engineer(&owner, &asset_id, &engineer);
         lc_client.submit_maintenance(
@@ -6456,11 +6956,12 @@ mod tests {
         // Advance time past several decay intervals
         env.ledger().with_mut(|li| li.timestamp += 50_000_000);
 
-        // Score must be frozen — no decay after decommission
+        // Fix #794: Score must be 0 after decommission, not frozen at pre-decommission value.
+        // A decommissioned asset must never be usable as DeFi collateral.
         let score_after = lc_client.get_collateral_score(&asset_id);
         assert_eq!(
-            score_after, score_at_decommission,
-            "lifecycle score must not decay after decommission_asset_notify"
+            score_after, 0,
+            "lifecycle score must be 0 after decommission_asset_notify (fix #794)"
         );
     }
 
@@ -6534,7 +7035,12 @@ mod tests {
             &owner,
         );
 
-        client.mark_under_maintenance(&owner, &asset_id);
+        // No public mark_under_maintenance API; set the flag directly via storage.
+        env.as_contract(&contract_id, || {
+            env.storage()
+                .persistent()
+                .set(&(symbol_short!("U_MAINT"), asset_id), &true);
+        });
 
         assert_eq!(
             client.asset_status(&asset_id),
@@ -6981,5 +7487,451 @@ mod tests {
         });
         assert_eq!(page.total, 110);
         assert_eq!(page.assets.len(), 100);
+    }
+
+    // ── #795 regression ──────────────────────────────────────────────────────
+    // Timelock comparisons must use env.ledger().timestamp() (Unix seconds) and
+    // NOT env.ledger().sequence() (ledger numbers).  These tests fix the
+    // expected timing so CI catches any accidental reversion to sequence().
+
+    /// The timelock must be measured in wall-clock seconds (timestamp), not
+    /// ledger sequence numbers.  TIMELOCK_DELAY_SECS = 48 * 60 * 60 seconds.
+    ///
+    /// Test plan:
+    ///   1. propose_deregister_asset  →  proposal stored with proposed_at = timestamp()
+    ///   2. execute immediately       →  must fail (TimelockNotExpired)
+    ///   3. advance timestamp by exactly TIMELOCK_DELAY_SECS
+    ///   4. execute again             →  must succeed (asset deregistered)
+    #[test]
+    fn test_timelock_uses_timestamp_not_sequence() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize_admin(&admin, &admin);
+        client.add_asset_type(&admin, &symbol_short!("GENSET"));
+
+        let owner = Address::generate(&env);
+        let asset_id = reg(&client, &env, symbol_short!("GENSET"), String::from_str(&env, "Test rig"), &owner);
+
+        // Step 1: propose deregistration — records proposed_at = current timestamp.
+        client.propose_deregister_asset(&owner, &asset_id);
+
+        // Step 2: attempt execution immediately — must be rejected.
+        // If the implementation used sequence() instead of timestamp() the delay would
+        // be ~48 h * 3600 s/h = 172_800 ledger numbers — essentially instant on testnet
+        // (current sequence ≈ 3 M), so this assertion would *pass* incorrectly.
+        // With the correct timestamp() comparison the delay has not yet elapsed.
+        let result_before = client.try_execute_deregister_asset(&owner, &asset_id);
+        assert_eq!(
+            result_before,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::TimelockNotExpired as u32,
+            ))),
+            "execute must be rejected before TIMELOCK_DELAY_SECS have elapsed"
+        );
+
+        // Step 3: advance ledger timestamp by exactly TIMELOCK_DELAY_SECS seconds.
+        // TIMELOCK_DELAY_SECS = 48 * 60 * 60 = 172_800 s.
+        const TIMELOCK_DELAY_SECS: u64 = 48 * 60 * 60;
+        env.ledger().with_mut(|li| li.timestamp += TIMELOCK_DELAY_SECS);
+
+        // Step 4: execution must now succeed — the timelock has elapsed.
+        client.execute_deregister_asset(&owner, &asset_id);
+
+        // Asset must be gone.
+        let result_after = client.try_get_asset(&asset_id);
+        assert!(
+            result_after.is_err(),
+            "asset must have been deregistered after timelock elapsed"
+        );
+    }
+
+    /// Confirm execution is still blocked one second before the deadline,
+    /// and succeeds one second after.  This guards against off-by-one errors.
+    #[test]
+    fn test_timelock_boundary_one_second_before_and_after() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize_admin(&admin, &admin);
+        client.add_asset_type(&admin, &symbol_short!("GENSET"));
+
+        let owner = Address::generate(&env);
+        let asset_id = reg(&client, &env, symbol_short!("GENSET"), String::from_str(&env, "Boundary rig"), &owner);
+
+        client.propose_deregister_asset(&owner, &asset_id);
+
+        // Advance to one second BEFORE the deadline — still locked.
+        const TIMELOCK_DELAY_SECS: u64 = 48 * 60 * 60;
+        env.ledger().with_mut(|li| li.timestamp += TIMELOCK_DELAY_SECS - 1);
+
+        let result_one_before = client.try_execute_deregister_asset(&owner, &asset_id);
+        assert_eq!(
+            result_one_before,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::TimelockNotExpired as u32,
+            ))),
+            "execute must still be locked 1 second before the deadline"
+        );
+
+        // Advance one more second — now at exactly the deadline.
+        env.ledger().with_mut(|li| li.timestamp += 1);
+
+        // Now execution must succeed.
+        client.execute_deregister_asset(&owner, &asset_id);
+        assert!(
+            client.try_get_asset(&asset_id).is_err(),
+            "asset must be deregistered after exactly TIMELOCK_DELAY_SECS elapsed"
+        );
+    }
+
+    // ─── Asset locking (collateral lien) tests ──────────────────────────────────
+
+    /// Helper: set up env, contract, admin + one GENSET asset.
+    fn setup_with_asset(env: &Env) -> (AssetRegistryClient, Address, Address, u64) {
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(env, &contract_id);
+
+        let admin = Address::generate(env);
+        client.initialize_admin(&admin, &admin);
+        client.add_asset_type(&admin, &symbol_short!("GENSET"));
+
+        let owner = Address::generate(env);
+        let asset_id = reg(
+            &client,
+            env,
+            symbol_short!("GENSET"),
+            String::from_str(env, "CAT-3516"),
+            &owner,
+        );
+
+        (client, admin, owner, asset_id)
+    }
+
+    #[test]
+    fn test_new_asset_is_not_locked() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _admin, _owner, asset_id) = setup_with_asset(&env);
+
+        let asset = client.get_asset(&asset_id);
+        assert!(!asset.is_locked, "freshly registered asset must not be locked");
+        assert!(asset.lender.is_none(), "freshly registered asset must have no lender");
+        assert!(asset.loan_id.is_none(), "freshly registered asset must have no loan_id");
+    }
+
+    #[test]
+    fn test_set_lending_contract_requires_admin() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, _owner, _asset_id) = setup_with_asset(&env);
+
+        let lending_contract = Address::generate(&env);
+        // Should succeed — admin calling
+        client.set_lending_contract(&admin, &lending_contract);
+
+        assert_eq!(
+            client.get_lending_contract(),
+            Some(lending_contract),
+            "lending contract must be retrievable after set_lending_contract"
+        );
+    }
+
+    #[test]
+    fn test_set_lending_contract_rejects_non_admin() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _admin, owner, _asset_id) = setup_with_asset(&env);
+
+        let lending_contract = Address::generate(&env);
+        let result = client.try_set_lending_contract(&owner, &lending_contract);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::UnauthorizedAdmin as u32
+            ))),
+            "non-admin must not be able to set the lending contract"
+        );
+    }
+
+    #[test]
+    fn test_lock_asset_as_collateral_succeeds() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, _owner, asset_id) = setup_with_asset(&env);
+
+        let lending_contract = Address::generate(&env);
+        client.set_lending_contract(&admin, &lending_contract);
+
+        let loan_id: u64 = 42;
+        client.lock_asset_as_collateral(&lending_contract, &asset_id, &loan_id);
+
+        let asset = client.get_asset(&asset_id);
+        assert!(asset.is_locked, "asset must be locked after lock_asset_as_collateral");
+        assert_eq!(asset.lender, Some(lending_contract), "lender must be stored on the asset");
+        assert_eq!(asset.loan_id, Some(loan_id), "loan_id must be stored on the asset");
+    }
+
+    #[test]
+    fn test_lock_asset_rejects_when_no_lending_contract_set() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _admin, _owner, asset_id) = setup_with_asset(&env);
+
+        let fake_lender = Address::generate(&env);
+        let result = client.try_lock_asset_as_collateral(&fake_lender, &asset_id, &1u64);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::LendingContractNotSet as u32
+            ))),
+            "lock must fail when no lending contract is registered"
+        );
+    }
+
+    #[test]
+    fn test_lock_asset_rejects_unauthorized_lender() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, _owner, asset_id) = setup_with_asset(&env);
+
+        let lending_contract = Address::generate(&env);
+        let impostor = Address::generate(&env);
+        client.set_lending_contract(&admin, &lending_contract);
+
+        let result = client.try_lock_asset_as_collateral(&impostor, &asset_id, &1u64);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::UnauthorizedLender as u32
+            ))),
+            "lock must fail when caller is not the registered lending contract"
+        );
+    }
+
+    #[test]
+    fn test_lock_asset_rejects_already_locked() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, _owner, asset_id) = setup_with_asset(&env);
+
+        let lending_contract = Address::generate(&env);
+        client.set_lending_contract(&admin, &lending_contract);
+
+        client.lock_asset_as_collateral(&lending_contract, &asset_id, &1u64);
+
+        // Attempt to lock again
+        let result = client.try_lock_asset_as_collateral(&lending_contract, &asset_id, &2u64);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::AssetLocked as u32
+            ))),
+            "locking an already-locked asset must return AssetLocked"
+        );
+    }
+
+    #[test]
+    fn test_lock_nonexistent_asset_returns_not_found() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, _owner, _asset_id) = setup_with_asset(&env);
+
+        let lending_contract = Address::generate(&env);
+        client.set_lending_contract(&admin, &lending_contract);
+
+        let result = client.try_lock_asset_as_collateral(&lending_contract, &9999u64, &1u64);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::AssetNotFound as u32
+            ))),
+            "locking a non-existent asset must return AssetNotFound"
+        );
+    }
+
+    #[test]
+    fn test_unlock_asset_from_collateral_succeeds() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, _owner, asset_id) = setup_with_asset(&env);
+
+        let lending_contract = Address::generate(&env);
+        client.set_lending_contract(&admin, &lending_contract);
+
+        let loan_id: u64 = 7;
+        client.lock_asset_as_collateral(&lending_contract, &asset_id, &loan_id);
+        client.unlock_asset_from_collateral(&lending_contract, &asset_id, &loan_id);
+
+        let asset = client.get_asset(&asset_id);
+        assert!(!asset.is_locked, "asset must not be locked after unlock_asset_from_collateral");
+        assert!(asset.lender.is_none(), "lender must be cleared after unlock");
+        assert!(asset.loan_id.is_none(), "loan_id must be cleared after unlock");
+    }
+
+    #[test]
+    fn test_unlock_asset_rejects_wrong_loan_id() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, _owner, asset_id) = setup_with_asset(&env);
+
+        let lending_contract = Address::generate(&env);
+        client.set_lending_contract(&admin, &lending_contract);
+
+        client.lock_asset_as_collateral(&lending_contract, &asset_id, &10u64);
+
+        let result = client.try_unlock_asset_from_collateral(&lending_contract, &asset_id, &99u64);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::LoanIdMismatch as u32
+            ))),
+            "unlock with wrong loan_id must return LoanIdMismatch"
+        );
+    }
+
+    #[test]
+    fn test_unlock_asset_rejects_when_not_locked() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, _owner, asset_id) = setup_with_asset(&env);
+
+        let lending_contract = Address::generate(&env);
+        client.set_lending_contract(&admin, &lending_contract);
+
+        let result = client.try_unlock_asset_from_collateral(&lending_contract, &asset_id, &1u64);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::AssetNotLocked as u32
+            ))),
+            "unlocking an unlocked asset must return AssetNotLocked"
+        );
+    }
+
+    #[test]
+    fn test_unlock_rejects_unauthorized_lender() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, _owner, asset_id) = setup_with_asset(&env);
+
+        let lending_contract = Address::generate(&env);
+        let impostor = Address::generate(&env);
+        client.set_lending_contract(&admin, &lending_contract);
+        client.lock_asset_as_collateral(&lending_contract, &asset_id, &1u64);
+
+        let result = client.try_unlock_asset_from_collateral(&impostor, &asset_id, &1u64);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::UnauthorizedLender as u32
+            ))),
+            "unlock must fail when caller is not the registered lending contract"
+        );
+    }
+
+    #[test]
+    fn test_transfer_blocked_when_asset_locked() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, owner, asset_id) = setup_with_asset(&env);
+
+        let lending_contract = Address::generate(&env);
+        client.set_lending_contract(&admin, &lending_contract);
+        client.lock_asset_as_collateral(&lending_contract, &asset_id, &5u64);
+
+        let new_owner = Address::generate(&env);
+        let result = client.try_transfer_asset(&asset_id, &owner, &new_owner);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::AssetLocked as u32
+            ))),
+            "transfer must be blocked while asset is locked as collateral"
+        );
+
+        // Ownership must remain unchanged
+        assert_eq!(client.get_asset(&asset_id).owner, owner);
+    }
+
+    #[test]
+    fn test_transfer_allowed_after_unlock() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, owner, asset_id) = setup_with_asset(&env);
+
+        let lending_contract = Address::generate(&env);
+        client.set_lending_contract(&admin, &lending_contract);
+
+        let loan_id: u64 = 3;
+        client.lock_asset_as_collateral(&lending_contract, &asset_id, &loan_id);
+        client.unlock_asset_from_collateral(&lending_contract, &asset_id, &loan_id);
+
+        let new_owner = Address::generate(&env);
+        client.transfer_asset(&asset_id, &owner, &new_owner);
+
+        assert_eq!(
+            client.get_asset(&asset_id).owner,
+            new_owner,
+            "transfer must succeed after the lien is released"
+        );
+    }
+
+    #[test]
+    fn test_lock_and_unlock_emits_events() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, _owner, asset_id) = setup_with_asset(&env);
+
+        let lending_contract = Address::generate(&env);
+        client.set_lending_contract(&admin, &lending_contract);
+
+        let loan_id: u64 = 77;
+        client.lock_asset_as_collateral(&lending_contract, &asset_id, &loan_id);
+        assert_eq!(env.events().all().len(), 1, "lock must emit exactly one event");
+
+        client.unlock_asset_from_collateral(&lending_contract, &asset_id, &loan_id);
+        assert_eq!(env.events().all().len(), 1, "unlock must emit exactly one event");
+    }
+
+    #[test]
+    fn test_lock_decommissioned_asset_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, _owner, asset_id) = setup_with_asset(&env);
+
+        let lending_contract = Address::generate(&env);
+        client.set_lending_contract(&admin, &lending_contract);
+
+        // Decommission the asset first
+        client.decommission_asset(&admin, &asset_id);
+
+        let result = client.try_lock_asset_as_collateral(&lending_contract, &asset_id, &1u64);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::AssetDecommissioned as u32
+            ))),
+            "decommissioned assets must not be lockable as collateral"
+        );
+    }
+
+    #[test]
+    fn test_get_lending_contract_returns_none_when_not_set() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _admin, _owner, _asset_id) = setup_with_asset(&env);
+
+        assert_eq!(
+            client.get_lending_contract(),
+            None,
+            "get_lending_contract must return None before set_lending_contract is called"
+        );
     }
 }

@@ -163,6 +163,10 @@ fn voucher_history_key(voucher: &Address) -> (soroban_sdk::Symbol, Address) {
     (symbol_short!("V_HIST"), voucher.clone())
 }
 
+fn liens_key(asset_id: u64) -> DataKey {
+    DataKey::Liens(asset_id)
+}
+
 fn get_admin(env: &Env) -> Address {
     env.storage()
         .persistent()
@@ -685,87 +689,96 @@ impl LendingContract {
         env.storage().persistent().get(&PAUSED_KEY).unwrap_or(false)
     }
 
-    /// Initiate the collateral liquidation process.
-    pub fn initiate_liquidation(env: Env, asset_id: u64, lender: Address, loan_id: u64) {
-        lender.require_auth();
+    /// Record a lien on an asset. Only the contract admin may call this.
+    ///
+    /// Stores a [`LienRecord`] indicating that `lender` has a claim of `amount`
+    /// against the asset identified by `asset_id` under the loan `loan_id`.
+    /// If an identical lien (same asset + lender + loan_id) already exists,
+    /// panics with [`ContractError::LienAlreadyExists`].
+    pub fn record_lien(
+        env: Env,
+        admin: Address,
+        asset_id: u64,
+        lender: Address,
+        loan_id: u64,
+        amount: u64,
+    ) {
+        require_admin(&env, &admin);
 
-        let borrower: Address = env
-            .storage()
-            .persistent()
-            .get(&(symbol_short!("L_MAP"), loan_id))
-            .unwrap_or_else(|| panic_with_error!(&env, ContractError::InvalidLoanId));
-
-        let key = loan_key(&borrower);
-        let loan: Loan = env
+        let key = liens_key(asset_id);
+        let mut liens: Vec<LienRecord> = env
             .storage()
             .persistent()
             .get(&key)
-            .unwrap_or_else(|| panic_with_error!(&env, ContractError::NoActiveLoan));
+            .unwrap_or_else(|| Vec::new(&env));
 
-        if loan.status != LoanStatus::Defaulted {
-            panic_with_error!(&env, ContractError::LoanNotDefaulted);
+        for lien in liens.iter() {
+            if lien.lender == lender && lien.loan_id == loan_id {
+                panic_with_error!(&env, ContractError::LienAlreadyExists);
+            }
         }
 
-        let default_time: u64 = env
-            .storage()
-            .persistent()
-            .get(&(symbol_short!("DEF_TIME"), borrower.clone()))
-            .unwrap_or_else(|| panic_with_error!(&env, ContractError::LoanNotDefaulted));
-
-        let grace_period = 15 * 24 * 60 * 60; // 15 days in seconds
-        if env.ledger().timestamp() < default_time + grace_period {
-            panic_with_error!(&env, ContractError::GracePeriodNotPassed);
-        }
-
-        let liq_key = (symbol_short!("LIQ"), asset_id);
-        if env.storage().persistent().has(&liq_key) {
-            panic_with_error!(&env, ContractError::LiquidationAlreadyInitiated);
-        }
-
-        let liquidation = Liquidation {
-            asset_id,
-            lender: lender.clone(),
+        liens.push_back(LienRecord {
+            lender,
             loan_id,
-            initiated_at: env.ledger().timestamp(),
-            completed: false,
-        };
-
-        env.storage().persistent().set(&liq_key, &liquidation);
+            amount,
+        });
+        env.storage().persistent().set(&key, &liens);
         env.storage()
             .persistent()
-            .extend_ttl(&liq_key, TTL_THRESHOLD, TTL_TARGET);
-
-        env.events().publish(
-            (Symbol::new(&env, "liq_init"), asset_id),
-            (lender, loan_id),
-        );
+            .extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
     }
 
-    /// Complete the collateral liquidation process.
-    pub fn complete_liquidation(env: Env, asset_id: u64, new_owner: Address) {
-        let liq_key = (symbol_short!("LIQ"), asset_id);
-        let mut liquidation: Liquidation = env
+    /// Release (remove) a previously recorded lien. Only the contract admin may call this.
+    ///
+    /// Panics with [`ContractError::LienNotFound`] if no matching lien exists
+    /// for the given asset, lender, and loan_id.
+    pub fn release_lien(
+        env: Env,
+        admin: Address,
+        asset_id: u64,
+        lender: Address,
+        loan_id: u64,
+    ) {
+        require_admin(&env, &admin);
+
+        let key = liens_key(asset_id);
+        let mut liens: Vec<LienRecord> = env
             .storage()
             .persistent()
-            .get(&liq_key)
-            .unwrap_or_else(|| panic_with_error!(&env, ContractError::LiquidationNotInitiated));
+            .get(&key)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::LienNotFound));
 
-        if liquidation.completed {
-            panic_with_error!(&env, ContractError::AssetAlreadyLiquidated);
+        let mut found_index: Option<u32> = None;
+        for (i, lien) in liens.iter().enumerate() {
+            if lien.lender == lender && lien.loan_id == loan_id {
+                found_index = Some(i as u32);
+                break;
+            }
         }
 
-        liquidation.lender.require_auth();
+        match found_index {
+            Some(idx) => {
+                liens.remove(idx);
+                if liens.is_empty() {
+                    env.storage().persistent().remove(&key);
+                } else {
+                    env.storage().persistent().set(&key, &liens);
+                    env.storage()
+                        .persistent()
+                        .extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
+                }
+            }
+            None => panic_with_error!(&env, ContractError::LienNotFound),
+        }
+    }
 
-        liquidation.completed = true;
-        env.storage().persistent().set(&liq_key, &liquidation);
+    /// Returns all active lien records for the given asset.
+    pub fn get_liens(env: Env, asset_id: u64) -> Vec<LienRecord> {
         env.storage()
             .persistent()
-            .extend_ttl(&liq_key, TTL_THRESHOLD, TTL_TARGET);
-
-        env.events().publish(
-            (Symbol::new(&env, "liq_comp"), asset_id),
-            (liquidation.lender.clone(), new_owner, liquidation.loan_id),
-        );
+            .get(&liens_key(asset_id))
+            .unwrap_or_else(|| Vec::new(&env))
     }
 }
 
@@ -788,7 +801,7 @@ mod tests {
         let admin = Address::generate(&env);
         let token = Address::generate(&env);
 
-        client.initialize(&deployer, &admin, &token);
+        client.initialize(&deployer, &admin, &token, &0);
         assert!(client.is_initialized());
     }
 
@@ -804,7 +817,7 @@ mod tests {
         let admin = Address::generate(&env);
         let token = Address::generate(&env);
 
-        client.initialize(&deployer, &admin, &token);
+        client.initialize(&deployer, &admin, &token, &0);
 
         let retrieved_admin = client.get_admin();
         assert_eq!(retrieved_admin, admin);
@@ -822,7 +835,7 @@ mod tests {
         let admin = Address::generate(&env);
         let token = Address::generate(&env);
 
-        client.initialize(&deployer, &admin, &token);
+        client.initialize(&deployer, &admin, &token, &0);
 
         let retrieved_token = client.get_token();
         assert_eq!(retrieved_token, token);
@@ -840,7 +853,7 @@ mod tests {
         let admin = Address::generate(&env);
         let token = Address::generate(&env);
 
-        client.initialize(&deployer, &admin, &token);
+        client.initialize(&deployer, &admin, &token, &0);
 
         // Verify initial slash balance is zero
         let initial_balance = client.get_slash_balance();
@@ -865,7 +878,7 @@ mod tests {
         let admin = Address::generate(&env);
         let token = Address::generate(&env);
 
-        client.initialize(&deployer, &admin, &token);
+        client.initialize(&deployer, &admin, &token, &0);
 
         (env, contract_id, admin, token, deployer)
     }
@@ -923,7 +936,7 @@ mod tests {
         let client = LendingContractClient::new(env, &contract_id);
         let deployer = Address::generate(env);
 
-        client.initialize(&deployer, &admin, &token);
+        client.initialize(&deployer, &admin, &token, &0);
 
         (contract_id, admin, token)
     }
@@ -1046,7 +1059,7 @@ mod tests {
         let contract_id = env.register(LendingContract, ());
         let client = LendingContractClient::new(&env, &contract_id);
 
-        client.initialize(&deployer, &admin, &token_addr);
+        client.initialize(&deployer, &admin, &token_addr, &0);
 
         let amount = 1000u64;
         client.request_loan(&borrower, &amount);
@@ -1090,7 +1103,7 @@ mod tests {
         let contract_id = env.register(LendingContract, ());
         let client = LendingContractClient::new(&env, &contract_id);
 
-        client.initialize(&deployer, &admin, &token_addr);
+        client.initialize(&deployer, &admin, &token_addr, &0);
         client.request_loan(&borrower, &1000u64);
 
         let stake = 100u64;
@@ -1131,7 +1144,7 @@ mod tests {
         let contract_id = env.register(LendingContract, ());
         let client = LendingContractClient::new(&env, &contract_id);
 
-        client.initialize(&deployer, &admin, &token_addr);
+        client.initialize(&deployer, &admin, &token_addr, &0);
         client.request_loan(&borrower, &1000u64);
 
         client.repay(&borrower);
@@ -1171,7 +1184,7 @@ mod tests {
         let contract_id = env.register(LendingContract, ());
         let client = LendingContractClient::new(&env, &contract_id);
 
-        client.initialize(&deployer, &admin, &token_addr);
+        client.initialize(&deployer, &admin, &token_addr, &0);
         client.request_loan(&borrower, &1000u64);
 
         client.slash(&admin, &borrower);
@@ -1239,63 +1252,174 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_liquidation_workflow() {
-        use soroban_sdk::testutils::Ledger;
+    // ── issue #876: lien recording ─────────────────────────────────────
 
+    #[test]
+    fn test_record_and_get_lien() {
         let env = Env::default();
         env.mock_all_auths();
 
-        let (contract_id, admin, _token) = setup_contract(&env);
+        let contract_id = env.register(LendingContract, ());
         let client = LendingContractClient::new(&env, &contract_id);
 
-        let borrower = Address::generate(&env);
+        let deployer = Address::generate(&env);
+        let admin = Address::generate(&env);
+        let token = Address::generate(&env);
+        client.initialize(&deployer, &admin, &token);
+
         let lender = Address::generate(&env);
-        let asset_id = 101u64;
+        client.record_lien(&admin, &1, &lender, &42, &1000);
 
-        // Request loan
-        client.request_loan(&borrower, &1000);
-        let loan = client.get_loan(&borrower).unwrap();
-        let loan_id = loan.id;
+        let liens = client.get_liens(&1);
+        assert_eq!(liens.len(), 1);
+        assert_eq!(liens.get(0).unwrap().lender, lender);
+        assert_eq!(liens.get(0).unwrap().loan_id, 42);
+        assert_eq!(liens.get(0).unwrap().amount, 1000);
+    }
 
-        // Slash to set as Defaulted
-        client.slash(&admin, &borrower);
+    #[test]
+    fn test_record_multiple_liens_same_asset() {
+        let env = Env::default();
+        env.mock_all_auths();
 
-        // Attempting to liquidate immediately should fail due to grace period
-        let res_init_early = client.try_initiate_liquidation(&asset_id, &lender, &loan_id);
-        assert_eq!(
-            res_init_early,
-            Err(Ok(soroban_sdk::Error::from_contract_error(
-                ContractError::GracePeriodNotPassed as u32
-            )))
-        );
+        let contract_id = env.register(LendingContract, ());
+        let client = LendingContractClient::new(&env, &contract_id);
 
-        // Advance ledger by 15 days (15 * 24 * 60 * 60 = 1_296_000 seconds)
-        env.ledger().with_mut(|l| l.timestamp += 1_296_000);
+        let deployer = Address::generate(&env);
+        let admin = Address::generate(&env);
+        let token = Address::generate(&env);
+        client.initialize(&deployer, &admin, &token);
 
-        // Initiate liquidation should now succeed
-        client.initiate_liquidation(&asset_id, &lender, &loan_id);
+        let lender1 = Address::generate(&env);
+        let lender2 = Address::generate(&env);
 
-        // Attempting to initiate again should fail
-        let res_init_again = client.try_initiate_liquidation(&asset_id, &lender, &loan_id);
-        assert_eq!(
-            res_init_again,
-            Err(Ok(soroban_sdk::Error::from_contract_error(
-                ContractError::LiquidationAlreadyInitiated as u32
-            )))
-        );
+        client.record_lien(&admin, &1, &lender1, &42, &1000);
+        client.record_lien(&admin, &1, &lender2, &99, &2500);
 
-        // Complete liquidation
-        let new_owner = Address::generate(&env);
-        client.complete_liquidation(&asset_id, &new_owner);
+        let liens = client.get_liens(&1);
+        assert_eq!(liens.len(), 2);
+    }
 
-        // Attempting to complete again should fail
-        let res_comp_again = client.try_complete_liquidation(&asset_id, &new_owner);
-        assert_eq!(
-            res_comp_again,
-            Err(Ok(soroban_sdk::Error::from_contract_error(
-                ContractError::AssetAlreadyLiquidated as u32
-            )))
-        );
+    #[test]
+    fn test_record_duplicate_lien_panics() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let contract_id = env.register(LendingContract, ());
+        let client = LendingContractClient::new(&env, &contract_id);
+
+        let deployer = Address::generate(&env);
+        let admin = Address::generate(&env);
+        let token = Address::generate(&env);
+        client.initialize(&deployer, &admin, &token);
+
+        let lender = Address::generate(&env);
+        client.record_lien(&admin, &1, &lender, &42, &1000);
+
+        let result = client.try_record_lien(&admin, &1, &lender, &42, &2000);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_release_lien() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let contract_id = env.register(LendingContract, ());
+        let client = LendingContractClient::new(&env, &contract_id);
+
+        let deployer = Address::generate(&env);
+        let admin = Address::generate(&env);
+        let token = Address::generate(&env);
+        client.initialize(&deployer, &admin, &token);
+
+        let lender = Address::generate(&env);
+        client.record_lien(&admin, &1, &lender, &42, &1000);
+        assert_eq!(client.get_liens(&1).len(), 1);
+
+        client.release_lien(&admin, &1, &lender, &42);
+        assert_eq!(client.get_liens(&1).len(), 0);
+    }
+
+    #[test]
+    fn test_release_nonexistent_lien_panics() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let contract_id = env.register(LendingContract, ());
+        let client = LendingContractClient::new(&env, &contract_id);
+
+        let deployer = Address::generate(&env);
+        let admin = Address::generate(&env);
+        let token = Address::generate(&env);
+        client.initialize(&deployer, &admin, &token);
+
+        let lender = Address::generate(&env);
+        let result = client.try_release_lien(&admin, &1, &lender, &42);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_record_lien_requires_admin() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let contract_id = env.register(LendingContract, ());
+        let client = LendingContractClient::new(&env, &contract_id);
+
+        let deployer = Address::generate(&env);
+        let admin = Address::generate(&env);
+        let token = Address::generate(&env);
+        client.initialize(&deployer, &admin, &token);
+
+        let non_admin = Address::generate(&env);
+        let lender = Address::generate(&env);
+
+        // With mock_all_auths any address passes auth — but require_admin
+        // checks the stored admin, so non_admin should still fail.
+        let result = client.try_record_lien(&non_admin, &1, &lender, &42, &1000);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_release_lien_requires_admin() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let contract_id = env.register(LendingContract, ());
+        let client = LendingContractClient::new(&env, &contract_id);
+
+        let deployer = Address::generate(&env);
+        let admin = Address::generate(&env);
+        let token = Address::generate(&env);
+        client.initialize(&deployer, &admin, &token);
+
+        let non_admin = Address::generate(&env);
+        let lender = Address::generate(&env);
+
+        let result = client.try_release_lien(&non_admin, &1, &lender, &42);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_get_liens_different_assets() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let contract_id = env.register(LendingContract, ());
+        let client = LendingContractClient::new(&env, &contract_id);
+
+        let deployer = Address::generate(&env);
+        let admin = Address::generate(&env);
+        let token = Address::generate(&env);
+        client.initialize(&deployer, &admin, &token);
+
+        let lender = Address::generate(&env);
+        client.record_lien(&admin, &1, &lender, &42, &1000);
+        client.record_lien(&admin, &2, &lender, &43, &2000);
+
+        assert_eq!(client.get_liens(&1).len(), 1);
+        assert_eq!(client.get_liens(&2).len(), 1);
+        assert_eq!(client.get_liens(&3).len(), 0);
     }
 }
