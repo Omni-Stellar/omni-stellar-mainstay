@@ -86,33 +86,20 @@ The orchestration contract. Binds AssetRegistry and EngineerRegistry together to
 
 ## Cross-Contract Call Flow
 
-The Lifecycle contract calls into the other two contracts on every maintenance submission. Neither AssetRegistry nor EngineerRegistry calls any other contract.
+The Lifecycle contract acts as the main orchestrator and is the only contract that initiates cross-contract calls. Neither `AssetRegistry` nor `EngineerRegistry` calls any other contract.
 
-```
-Engineer (caller)
-      │
-      │  submit_maintenance(asset_id, task_type, notes, engineer)
-      ▼
-┌─────────────────────────────────────────────────────────┐
-│                     Lifecycle                           │
-│                                                         │
-│  1. engineer.require_auth()                             │
-│                                                         │
-│  2. ──► AssetRegistry::get_asset(asset_id)              │
-│         • Panics with AssetNotFound if unknown          │
-│                                                         │
-│  3. ──► EngineerRegistry::verify_engineer(engineer)     │
-│         • Returns false if inactive or expired          │
-│         • Panics with UnauthorizedEngineer if false     │
-│                                                         │
-│  4. Append MaintenanceRecord to history                 │
-│  5. Recalculate and persist collateral score            │
-│  6. Append ScoreEntry snapshot                          │
-│  7. Emit maintenance event                              │
-└─────────────────────────────────────────────────────────┘
-```
+### Cross-Contract Call Mapping
 
-`batch_submit_maintenance` follows the same flow but validates all records fit within `max_history` before writing any of them.
+| Calling Contract | Calling Function | Target Contract | Target Function | Purpose |
+|------------------|-------------------|-----------------|-----------------|---------|
+| `Lifecycle` | `submit_maintenance` / `batch_submit_maintenance` | `AssetRegistry` | `try_get_asset` | Verifies that the asset exists. Panics with `AssetNotFound` if it does not. |
+| `Lifecycle` | `submit_maintenance` / `batch_submit_maintenance` | `EngineerRegistry` | `get_credential_status` | Retrieves the engineer's credential status. |
+| `Lifecycle` | `submit_maintenance` / `batch_submit_maintenance` | `EngineerRegistry` | `verify_engineer` | Fallback check called if the status from `get_credential_status` is not `Valid` or `GracePeriod`. Panics with `UnauthorizedEngineer` if verification fails. |
+| `Lifecycle` | `submit_maintenance` / `batch_submit_maintenance` | `EngineerRegistry` | `get_reputation` | Fetches the engineer's reputation score to weight the collateral score increment. |
+| `Lifecycle` | `record_transfer` | `AssetRegistry` | `try_get_asset` | Verifies that the asset exists. |
+| `Lifecycle` | `record_transfer` | `AssetRegistry` | `get_asset` | Fetches the asset to verify that the `new_owner` matches the current owner in the registry. Panics with `UnauthorizedOwner` if they do not match. |
+| `Lifecycle` | `get_collateral_score` / `get_collateral_score_batch` | `AssetRegistry` | `try_get_asset` | Verifies that the asset exists. |
+| `Lifecycle` | `get_collateral_score` / `get_collateral_score_batch` | `AssetRegistry` | `get_asset` | Fetches the asset to verify that its deprecation status is `Active` (deprecated assets return `0` immediately). |
 
 ---
 
