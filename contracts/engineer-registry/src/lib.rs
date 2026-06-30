@@ -86,8 +86,6 @@ const TIMELOCK_DELAY_SECS: u64 = 48 * 60 * 60;
 const DEFAULT_GRACE_PERIOD_SECS: u64 = 7 * 86_400;
 const GRACE_PERIOD_KEY: Symbol = symbol_short!("GRACE_P");
 const MAX_BATCH_REVOKE: u32 = 50;
-/// Grace period allowing engineers to work after credential expiry (7 days).
-const GRACE_PERIOD_SECS: u64 = 7 * 86_400;
 
 /// Soroban persistent-storage TTL constants.
 /// 1 ledger ≈ 5 seconds → 518_400 ledgers ≈ 30 days.
@@ -330,13 +328,18 @@ impl EngineerRegistry {
     /// Verify if an engineer has valid, active credentials with detailed status.
     /// Distinguishes between valid, expired, revoked, and never-registered engineers.
     ///
+    /// This is a read-only call and intentionally bypasses the pause guard.
+    /// Blocking reads during a pause would prevent the lifecycle contract from
+    /// checking credentials at all, which is worse than returning a stale result.
+    /// Write operations (register, revoke, renew) remain blocked while paused.
+    ///
     /// # Arguments
     /// * `engineer` - The address of the engineer to verify
     ///
     /// # Returns
     /// A CredentialStatus enum:
     /// - `CredentialStatus::Valid` if the engineer has active, non-expired credentials
-    /// - `CredentialStatus::Expired` if the engineer exists but credentials are expired
+    /// - `CredentialStatus::HardExpired` if the engineer exists but credentials are expired
     /// - `CredentialStatus::Revoked` if the engineer exists but credentials are revoked
     /// - `CredentialStatus::NotFound` if the engineer was never registered
     pub fn verify_engineer(env: Env, engineer: Address) -> CredentialStatus {
@@ -416,8 +419,6 @@ impl EngineerRegistry {
         if !record.active {
             panic_with_error!(&env, ContractError::CredentialAlreadyRevoked);
         }
-        let credential_hash = record.credential_hash.clone();
-        let revoked_by = record.issuer.clone();
         // Extend TTL before write to ensure consistency even on near-expired entries
         env.storage()
             .persistent()
@@ -428,7 +429,6 @@ impl EngineerRegistry {
             .set(&engineer_key(&engineer), &record);
 
         // Emit credential revocation event
-        let timestamp = env.ledger().timestamp();
         env.events().publish(
             (symbol_short!("ADM_AUD"), symbol_short!("REV_CRED")),
             (
@@ -3235,6 +3235,27 @@ mod tests {
             CredentialStatus::NotFound,
             "never-registered engineer should still return NotFound after other operations"
         );
+    }
+
+    #[test]
+    fn test_verify_engineer_succeeds_while_paused() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin) = setup(&env);
+
+        let engineer = Address::generate(&env);
+        let issuer = Address::generate(&env);
+        let hash = BytesN::from_array(&env, &[1u8; 32]);
+
+        client.add_trusted_issuer(&admin, &issuer);
+        client.register_engineer(&engineer, &hash, &issuer, &31_536_000, &None);
+
+        client.pause(&admin);
+        assert!(client.is_paused());
+
+        // reads must still work while paused so the lifecycle contract isn't blocked
+        assert_eq!(client.verify_engineer(&engineer), CredentialStatus::Valid);
+        assert_eq!(client.verify_engineer(&Address::generate(&env)), CredentialStatus::NotFound);
     }
 
     // --- Grace Period Tests ---

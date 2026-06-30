@@ -33,7 +33,7 @@ pub enum ContractError {
     /// Asset has already been deprecated and cannot be deprecated again.
     AssetAlreadyDeprecated = 17,
     /// The batch exceeds the maximum allowed size.
-    BatchTooLarge = 17,
+    BatchTooLarge = 18,
 }
 
 #[contracttype]

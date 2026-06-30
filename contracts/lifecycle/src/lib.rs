@@ -281,9 +281,6 @@ mod engineer_registry {
     #[allow(dead_code)]
     #[contractclient(name = "EngineerRegistryClient")]
     pub trait EngineerRegistry {
-        fn verify_engineer(env: Env, engineer: Address) -> Option<bool>;
-        fn batch_verify_engineers(env: Env, engineers: Vec<Address>) -> Vec<bool>;
-        fn get_reputation(env: Env, engineer: Address) -> u32;
         fn verify_engineer(env: Env, engineer: Address) -> CredentialStatus;
         fn batch_verify_engineers(env: Env, engineers: Vec<Address>) -> Vec<CredentialStatus>;
         fn get_credential_status(env: Env, engineer: Address) -> CredentialStatus;

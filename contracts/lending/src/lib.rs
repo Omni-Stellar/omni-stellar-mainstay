@@ -708,7 +708,7 @@ mod tests {
         let admin = Address::generate(&env);
         let token = Address::generate(&env);
 
-        client.initialize(&deployer, &admin, &token);
+        client.initialize(&deployer, &admin, &token, &0);
         assert!(client.is_initialized());
     }
 
@@ -724,7 +724,7 @@ mod tests {
         let admin = Address::generate(&env);
         let token = Address::generate(&env);
 
-        client.initialize(&deployer, &admin, &token);
+        client.initialize(&deployer, &admin, &token, &0);
 
         let retrieved_admin = client.get_admin();
         assert_eq!(retrieved_admin, admin);
@@ -742,7 +742,7 @@ mod tests {
         let admin = Address::generate(&env);
         let token = Address::generate(&env);
 
-        client.initialize(&deployer, &admin, &token);
+        client.initialize(&deployer, &admin, &token, &0);
 
         let retrieved_token = client.get_token();
         assert_eq!(retrieved_token, token);
@@ -760,7 +760,7 @@ mod tests {
         let admin = Address::generate(&env);
         let token = Address::generate(&env);
 
-        client.initialize(&deployer, &admin, &token);
+        client.initialize(&deployer, &admin, &token, &0);
 
         // Verify initial slash balance is zero
         let initial_balance = client.get_slash_balance();
@@ -785,7 +785,7 @@ mod tests {
         let admin = Address::generate(&env);
         let token = Address::generate(&env);
 
-        client.initialize(&deployer, &admin, &token);
+        client.initialize(&deployer, &admin, &token, &0);
 
         (env, contract_id, admin, token, deployer)
     }
@@ -844,7 +844,7 @@ mod tests {
         let client = LendingContractClient::new(env, &contract_id);
         let deployer = Address::generate(env);
 
-        client.initialize(&deployer, &admin, &token);
+        client.initialize(&deployer, &admin, &token, &0);
 
         (contract_id, admin, token)
     }
@@ -967,7 +967,7 @@ mod tests {
         let contract_id = env.register(LendingContract, ());
         let client = LendingContractClient::new(&env, &contract_id);
 
-        client.initialize(&deployer, &admin, &token_addr);
+        client.initialize(&deployer, &admin, &token_addr, &0);
 
         let amount = 1000u64;
         client.request_loan(&borrower, &amount);
@@ -1008,7 +1008,7 @@ mod tests {
         let contract_id = env.register(LendingContract, ());
         let client = LendingContractClient::new(&env, &contract_id);
 
-        client.initialize(&deployer, &admin, &token_addr);
+        client.initialize(&deployer, &admin, &token_addr, &0);
         client.request_loan(&borrower, &1000u64);
 
         let stake = 100u64;
@@ -1049,7 +1049,7 @@ mod tests {
         let contract_id = env.register(LendingContract, ());
         let client = LendingContractClient::new(&env, &contract_id);
 
-        client.initialize(&deployer, &admin, &token_addr);
+        client.initialize(&deployer, &admin, &token_addr, &0);
         client.request_loan(&borrower, &1000u64);
 
         client.repay(&borrower);
@@ -1089,7 +1089,7 @@ mod tests {
         let contract_id = env.register(LendingContract, ());
         let client = LendingContractClient::new(&env, &contract_id);
 
-        client.initialize(&deployer, &admin, &token_addr);
+        client.initialize(&deployer, &admin, &token_addr, &0);
         client.request_loan(&borrower, &1000u64);
 
         client.slash(&admin, &borrower);
