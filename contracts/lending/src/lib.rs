@@ -39,6 +39,18 @@ pub enum ContractError {
     TooManyVouchers = 14,
     /// Voucher withdrawal not allowed.
     VouchWithdrawNotAllowed = 15,
+    /// Loan is not defaulted.
+    LoanNotDefaulted = 16,
+    /// Grace period has not passed.
+    GracePeriodNotPassed = 17,
+    /// Liquidation already initiated.
+    LiquidationAlreadyInitiated = 18,
+    /// Liquidation not initiated.
+    LiquidationNotInitiated = 19,
+    /// Asset already liquidated.
+    AssetAlreadyLiquidated = 20,
+    /// Invalid loan ID.
+    InvalidLoanId = 21,
 }
 
 #[contracttype]
@@ -58,6 +70,7 @@ pub struct Loan {
     pub amount: u64,
     pub status: LoanStatus,
     pub deadline: u64,
+    pub id: u64,
 }
 
 #[contracttype]
@@ -71,6 +84,16 @@ pub struct Vouch {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Borrower {
     pub default_count: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Liquidation {
+    pub asset_id: u64,
+    pub lender: Address,
+    pub loan_id: u64,
+    pub initiated_at: u64,
+    pub completed: bool,
 }
 
 #[contracttype]
@@ -248,11 +271,17 @@ impl LendingContract {
         }
 
         let deadline = env.ledger().timestamp() + get_loan_duration(&env);
+        let loan_id_counter: u64 = env.storage().persistent().get(&symbol_short!("L_COUNT")).unwrap_or(0);
+        let new_loan_id = loan_id_counter + 1;
+        env.storage().persistent().set(&symbol_short!("L_COUNT"), &new_loan_id);
+        env.storage().persistent().set(&(symbol_short!("L_MAP"), new_loan_id), &borrower);
+
         let loan = Loan {
             borrower: borrower.clone(),
             amount,
             status: LoanStatus::Active,
             deadline,
+            id: new_loan_id,
         };
         env.storage().persistent().set(&key, &loan);
         env.storage()
@@ -473,6 +502,12 @@ impl LendingContract {
             .persistent()
             .extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
 
+        let default_time = env.ledger().timestamp();
+        env.storage().persistent().set(&(symbol_short!("DEF_TIME"), borrower.clone()), &default_time);
+        env.storage()
+            .persistent()
+            .extend_ttl(&(symbol_short!("DEF_TIME"), borrower.clone()), TTL_THRESHOLD, TTL_TARGET);
+
         let borrower_key_val = borrower_key(&borrower);
         if let Some(mut borrower_record) = env
             .storage()
@@ -686,6 +721,89 @@ impl LendingContract {
     /// Returns true if the contract is currently paused.
     pub fn is_paused(env: Env) -> bool {
         env.storage().persistent().get(&PAUSED_KEY).unwrap_or(false)
+    }
+
+    /// Initiate the collateral liquidation process.
+    pub fn initiate_liquidation(env: Env, asset_id: u64, lender: Address, loan_id: u64) {
+        lender.require_auth();
+
+        let borrower: Address = env
+            .storage()
+            .persistent()
+            .get(&(symbol_short!("L_MAP"), loan_id))
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::InvalidLoanId));
+
+        let key = loan_key(&borrower);
+        let loan: Loan = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::NoActiveLoan));
+
+        if loan.status != LoanStatus::Defaulted {
+            panic_with_error!(&env, ContractError::LoanNotDefaulted);
+        }
+
+        let default_time: u64 = env
+            .storage()
+            .persistent()
+            .get(&(symbol_short!("DEF_TIME"), borrower.clone()))
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::LoanNotDefaulted));
+
+        let grace_period = 15 * 24 * 60 * 60; // 15 days in seconds
+        if env.ledger().timestamp() < default_time + grace_period {
+            panic_with_error!(&env, ContractError::GracePeriodNotPassed);
+        }
+
+        let liq_key = (symbol_short!("LIQ"), asset_id);
+        if env.storage().persistent().has(&liq_key) {
+            panic_with_error!(&env, ContractError::LiquidationAlreadyInitiated);
+        }
+
+        let liquidation = Liquidation {
+            asset_id,
+            lender: lender.clone(),
+            loan_id,
+            initiated_at: env.ledger().timestamp(),
+            completed: false,
+        };
+
+        env.storage().persistent().set(&liq_key, &liquidation);
+        env.storage()
+            .persistent()
+            .extend_ttl(&liq_key, TTL_THRESHOLD, TTL_TARGET);
+
+        env.events().publish(
+            (Symbol::new(&env, "liq_init"), asset_id),
+            (lender, loan_id),
+        );
+    }
+
+    /// Complete the collateral liquidation process.
+    pub fn complete_liquidation(env: Env, asset_id: u64, new_owner: Address) {
+        let liq_key = (symbol_short!("LIQ"), asset_id);
+        let mut liquidation: Liquidation = env
+            .storage()
+            .persistent()
+            .get(&liq_key)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::LiquidationNotInitiated));
+
+        if liquidation.completed {
+            panic_with_error!(&env, ContractError::AssetAlreadyLiquidated);
+        }
+
+        liquidation.lender.require_auth();
+
+        liquidation.completed = true;
+        env.storage().persistent().set(&liq_key, &liquidation);
+        env.storage()
+            .persistent()
+            .extend_ttl(&liq_key, TTL_THRESHOLD, TTL_TARGET);
+
+        env.events().publish(
+            (Symbol::new(&env, "liq_comp"), asset_id),
+            (liquidation.lender.clone(), new_owner, liquidation.loan_id),
+        );
     }
 }
 
@@ -1153,6 +1271,66 @@ mod tests {
             client.try_request_loan(&borrower, &1000),
             Err(Ok(soroban_sdk::Error::from_contract_error(
                 ContractError::ContractPaused as u32
+            )))
+        );
+    }
+
+    #[test]
+    fn test_liquidation_workflow() {
+        use soroban_sdk::testutils::Ledger;
+
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (contract_id, admin, _token) = setup_contract(&env);
+        let client = LendingContractClient::new(&env, &contract_id);
+
+        let borrower = Address::generate(&env);
+        let lender = Address::generate(&env);
+        let asset_id = 101u64;
+
+        // Request loan
+        client.request_loan(&borrower, &1000);
+        let loan = client.get_loan(&borrower).unwrap();
+        let loan_id = loan.id;
+
+        // Slash to set as Defaulted
+        client.slash(&admin, &borrower);
+
+        // Attempting to liquidate immediately should fail due to grace period
+        let res_init_early = client.try_initiate_liquidation(&asset_id, &lender, &loan_id);
+        assert_eq!(
+            res_init_early,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::GracePeriodNotPassed as u32
+            )))
+        );
+
+        // Advance ledger by 15 days (15 * 24 * 60 * 60 = 1_296_000 seconds)
+        env.ledger().with_mut(|l| l.timestamp += 1_296_000);
+
+        // Initiate liquidation should now succeed
+        client.initiate_liquidation(&asset_id, &lender, &loan_id);
+
+        // Attempting to initiate again should fail
+        let res_init_again = client.try_initiate_liquidation(&asset_id, &lender, &loan_id);
+        assert_eq!(
+            res_init_again,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::LiquidationAlreadyInitiated as u32
+            )))
+        );
+
+        // Complete liquidation
+        let new_owner = Address::generate(&env);
+        client.complete_liquidation(&asset_id, &new_owner);
+
+        // Attempting to complete again should fail
+        let res_comp_again = client.try_complete_liquidation(&asset_id, &new_owner);
+        assert_eq!(
+            res_comp_again,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::AssetAlreadyLiquidated as u32
             )))
         );
     }
