@@ -4201,6 +4201,7 @@ mod tests {
     }
 
     #[test]
+    fn test_get_reputation_default_is_zero() {
     fn test_suspend_engineer_makes_credential_suspended() {
         let env = Env::default();
         env.mock_all_auths();
