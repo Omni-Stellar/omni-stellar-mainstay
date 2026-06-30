@@ -11,8 +11,8 @@ use crate::types::{
 };
 use shared::validation::require_non_empty_vec;
 use soroban_sdk::{
-    contract, contractimpl, panic_with_error, symbol_short, Address, BytesN, Env, String, Symbol,
-    Vec, Map,
+    contract, contractimpl, panic_with_error, symbol_short, Address, Bytes, BytesN, Env, Map,
+    String, Symbol, Vec,
 };
 
 const ASSET_REGISTRY: Symbol = symbol_short!("REGISTRY");
@@ -92,6 +92,11 @@ fn frozen_score_key(asset_id: u64) -> (Symbol, u64) {
 fn health_snapshot_key(asset_id: u64) -> (Symbol, u64) {
     (symbol_short!("HLTH_SNP"), asset_id)
 }
+
+fn scoring_weights_key(env: &Env, asset_type: &Symbol) -> DataKey {
+    DataKey::ScoringWeights(asset_type.to_xdr(env))
+}
+
 fn revoke_eng_timelock_key(asset_id: u64, engineer: &Address) -> (Symbol, u64, Address) {
     (symbol_short!("RVK_TL"), asset_id, engineer.clone())
 }
@@ -210,6 +215,187 @@ fn require_admin(env: &Env, admin: &Address) {
         .unwrap_or_else(|| panic_with_error!(env, ContractError::NotInitialized));
     if config.admin != *admin {
         panic_with_error!(env, ContractError::UnauthorizedAdmin);
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FrequencyWeights {
+    low: u32,
+    medium: u32,
+    high: u32,
+    medium_threshold: u32,
+    high_threshold: u32,
+    window_days: u32,
+}
+
+fn json_number(bytes: &Bytes, key: &[u8]) -> Option<u32> {
+    let len = bytes.len();
+    if len == 0 || key.is_empty() || key.len() as u32 >= len {
+        return None;
+    }
+
+    let mut i: u32 = 0;
+    while i + key.len() as u32 <= len {
+        let mut matched = true;
+        let mut j: u32 = 0;
+        while j < key.len() as u32 {
+            if bytes.get(i + j).unwrap() != key[j as usize] {
+                matched = false;
+                break;
+            }
+            j += 1;
+        }
+
+        if matched {
+            let mut k = i + key.len() as u32;
+            while k < len {
+                let ch = bytes.get(k).unwrap();
+                if ch == b':' {
+                    k += 1;
+                    break;
+                }
+                k += 1;
+            }
+            while k < len {
+                let ch = bytes.get(k).unwrap();
+                if ch.is_ascii_digit() {
+                    break;
+                }
+                k += 1;
+            }
+            if k == len {
+                return None;
+            }
+
+            let mut value: u32 = 0;
+            let mut found_digit = false;
+            while k < len {
+                let ch = bytes.get(k).unwrap();
+                if !ch.is_ascii_digit() {
+                    break;
+                }
+                found_digit = true;
+                value = value.saturating_mul(10).saturating_add((ch - b'0') as u32);
+                k += 1;
+            }
+            if found_digit {
+                return Some(value);
+            }
+            return None;
+        }
+
+        i += 1;
+    }
+
+    None
+}
+
+fn parse_frequency_weights(weights_json: &Bytes) -> Option<FrequencyWeights> {
+    let low = json_number(weights_json, b"\"low\"")?;
+    let medium = json_number(weights_json, b"\"medium\"")?;
+    let high = json_number(weights_json, b"\"high\"")?;
+    let medium_threshold = json_number(weights_json, b"\"medium_threshold\"").unwrap_or(4);
+    let high_threshold = json_number(weights_json, b"\"high_threshold\"").unwrap_or(12);
+    let window_days = json_number(weights_json, b"\"window_days\"").unwrap_or(365);
+
+    if low == 0
+        || medium == 0
+        || high == 0
+        || window_days == 0
+        || medium_threshold == 0
+        || high_threshold < medium_threshold
+    {
+        return None;
+    }
+
+    Some(FrequencyWeights {
+        low,
+        medium,
+        high,
+        medium_threshold,
+        high_threshold,
+        window_days,
+    })
+}
+
+fn recent_maintenance_count(env: &Env, asset_id: u64, window_days: u32) -> u32 {
+    let history: Vec<MaintenanceRecord> = env
+        .storage()
+        .persistent()
+        .get(&history_key(asset_id))
+        .unwrap_or_else(|| Vec::new(env));
+    if history.is_empty() {
+        return 0;
+    }
+
+    let window_secs = (window_days as u64).saturating_mul(24 * 60 * 60);
+    let cutoff = env.ledger().timestamp().saturating_sub(window_secs);
+    let mut count = 0u32;
+
+    for record in history.iter() {
+        if record.task_type != symbol_short!("XFER") && record.timestamp >= cutoff {
+            count = count.saturating_add(1);
+        }
+    }
+
+    count
+}
+
+fn apply_dynamic_frequency_weight(env: &Env, asset_id: u64, asset_type: &Symbol, score: u32) -> u32 {
+    if score == 0 {
+        return 0;
+    }
+
+    let Some(weights_json) = env
+        .storage()
+        .persistent()
+        .get::<_, Bytes>(&scoring_weights_key(env, asset_type))
+    else {
+        return score;
+    };
+
+    let Some(weights) = parse_frequency_weights(&weights_json) else {
+        return score;
+    };
+
+    let maintenance_count = recent_maintenance_count(env, asset_id, weights.window_days);
+    let multiplier = if maintenance_count >= weights.high_threshold {
+        weights.high
+    } else if maintenance_count >= weights.medium_threshold {
+        weights.medium
+    } else {
+        weights.low
+    };
+
+    ((score as u64).saturating_mul(multiplier as u64) / 100) as u32
+}
+
+fn compute_read_only_collateral_score(env: &Env, asset_id: u64, asset_type: &Symbol, config: &Config) -> u32 {
+    let history_score = compute_decay(env, asset_id);
+    let stored: u32 = env.storage().persistent().get(&score_key(asset_id)).unwrap_or(0);
+    let last_update: u64 = env
+        .storage()
+        .persistent()
+        .get(&last_update_key(asset_id))
+        .unwrap_or(0);
+    let elapsed = env.ledger().timestamp().saturating_sub(last_update);
+    let intervals = elapsed / config.decay_interval;
+    let decay = (intervals as u32).saturating_mul(config.decay_rate);
+    let config_score = stored.saturating_sub(decay);
+    let score = history_score.min(config_score);
+    let weighted_score = apply_dynamic_frequency_weight(env, asset_id, asset_type, score).min(100);
+
+    let has_history = env
+        .storage()
+        .persistent()
+        .get::<_, Vec<MaintenanceRecord>>(&history_key(asset_id))
+        .map(|h| !h.is_empty())
+        .unwrap_or(false);
+
+    if has_history && weighted_score < MIN_SCORE_WITH_HISTORY {
+        MIN_SCORE_WITH_HISTORY
+    } else {
+        weighted_score
     }
 }
 
@@ -1088,6 +1274,44 @@ impl Lifecycle {
         );
     }
 
+    /// Admin-only function to set per-asset-type maintenance-frequency scoring weights.
+    ///
+    /// `weights_json` is stored verbatim and interpreted as a JSON object with these keys:
+    /// `low`, `medium`, `high`, and optional `medium_threshold`, `high_threshold`, `window_days`.
+    /// Weight values are treated as percentages, so `120` means a 1.2x multiplier.
+    pub fn update_scoring_weights(env: Env, admin: Address, asset_type: Symbol, weights_json: Bytes) {
+        ensure_not_paused(&env);
+        require_admin(&env, &admin);
+
+        if parse_frequency_weights(&weights_json).is_none() {
+            panic_with_error!(&env, ContractError::InvalidConfig);
+        }
+
+        let key = scoring_weights_key(&env, &asset_type);
+        env.storage().persistent().set(&key, &weights_json);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
+
+        env.events().publish(
+            (symbol_short!("SCR_WT"), asset_type.clone()),
+            weights_json.clone(),
+        );
+        env.events().publish(
+            (symbol_short!("ADM_AUD"), symbol_short!("SCR_WT")),
+            (admin, env.ledger().timestamp(), asset_type, weights_json),
+        );
+    }
+
+    /// Returns the stored dynamic scoring weights for an asset type.
+    /// If none are configured, an empty `Bytes` value is returned.
+    pub fn get_scoring_weights(env: Env, asset_type: Symbol) -> Bytes {
+        env.storage()
+            .persistent()
+            .get(&scoring_weights_key(&env, &asset_type))
+            .unwrap_or_else(|| Bytes::from_slice(&env, &[]))
+    }
+
     /// Submit a maintenance record for an asset.
     /// Only verified engineers can submit maintenance records.
     ///
@@ -1649,44 +1873,8 @@ impl Lifecycle {
                 .get(&frozen_score_key(asset_id))
                 .unwrap_or(0);
         }
-        // Compute score from maintenance history (recency-weighted, decreases as records age).
-        let history_score = compute_decay(&env, asset_id);
 
-        // Compute score from accumulated stored value with lazy config-based decay applied.
-        // This is read-only — does NOT write back to storage.
-        let config_score = {
-            let stored: u32 = env
-                .storage()
-                .persistent()
-                .get(&score_key(asset_id))
-                .unwrap_or(0);
-            let last_update: u64 = env
-                .storage()
-                .persistent()
-                .get(&last_update_key(asset_id))
-                .unwrap_or(0);
-            let elapsed = env.ledger().timestamp().saturating_sub(last_update);
-            let intervals = elapsed / config.decay_interval;
-            let decay = (intervals as u32).saturating_mul(config.decay_rate);
-            stored.saturating_sub(decay)
-        };
-
-        // Use the lower of the two scores so both models can constrain the result.
-        let score = history_score.min(config_score);
-
-        // Apply floor: an asset with at least one maintenance record always scores >= 1
-        // so it is never indistinguishable from an asset with no history.
-        let has_history = env
-            .storage()
-            .persistent()
-            .get::<_, Vec<MaintenanceRecord>>(&history_key(asset_id))
-            .map(|h| !h.is_empty())
-            .unwrap_or(false);
-        let final_score = if has_history && score < MIN_SCORE_WITH_HISTORY {
-            MIN_SCORE_WITH_HISTORY
-        } else {
-            score
-        };
+        let final_score = compute_read_only_collateral_score(&env, asset_id, &asset.asset_type, &config);
         // Persist the computed score so stored and returned values are always consistent.
         env.storage()
             .persistent()
@@ -1724,10 +1912,18 @@ impl Lifecycle {
         let client = asset_registry::AssetRegistryClient::new(&env, &asset_registry);
         let mut results: Vec<(u64, u32)> = Vec::new(&env);
         for asset_id in asset_ids.iter() {
-            if client.try_get_asset(&asset_id).is_err() {
+            let Ok(asset) = client.try_get_asset(&asset_id) else {
+                continue;
+            };
+            if asset.deprecation_status != asset_registry::DeprecationStatus::Active {
+                results.push_back((asset_id, 0));
                 continue;
             }
-            let score = apply_decay(&env, asset_id, false, false, config.max_history);
+            let score = if env.storage().persistent().get::<_, bool>(&frozen_key(asset_id)).unwrap_or(false) {
+                env.storage().persistent().get(&frozen_score_key(asset_id)).unwrap_or(0)
+            } else {
+                compute_read_only_collateral_score(&env, asset_id, &asset.asset_type, &config)
+            };
             results.push_back((asset_id, score));
         }
         results
@@ -1814,21 +2010,16 @@ impl Lifecycle {
             .persistent()
             .get(&CONFIG)
             .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
-
-        // Use read-only decay computation since we already verified asset exists
-        let score = compute_decay(&env, asset_id);
-        let has_history = env
-            .storage()
-            .persistent()
-            .get::<_, Vec<MaintenanceRecord>>(&history_key(asset_id))
-            .map(|h| !h.is_empty())
-            .unwrap_or(false);
-        let effective_score = if has_history && score < MIN_SCORE_WITH_HISTORY {
-            MIN_SCORE_WITH_HISTORY
+        let asset = asset_registry::AssetRegistryClient::new(&env, &asset_registry).get_asset(&asset_id);
+        if asset.deprecation_status != asset_registry::DeprecationStatus::Active {
+            return false;
+        }
+        let score = if env.storage().persistent().get::<_, bool>(&frozen_key(asset_id)).unwrap_or(false) {
+            env.storage().persistent().get(&frozen_score_key(asset_id)).unwrap_or(0)
         } else {
-            score
+            compute_read_only_collateral_score(&env, asset_id, &asset.asset_type, &config)
         };
-        effective_score >= config.eligibility_threshold
+        score >= config.eligibility_threshold
     }
 
     /// Returns the timestamp of the most recent maintenance event, or None if no maintenance has been submitted.
@@ -2270,10 +2461,15 @@ impl Lifecycle {
         let asset_registry_client = asset_registry::AssetRegistryClient::new(&env, &asset_registry);
         let mut results: Vec<bool> = Vec::new(&env);
         for asset_id in asset_ids.iter() {
-            // Verify asset exists (panics with AssetNotFound if not)
-            asset_registry_client.get_asset(&asset_id);
-            // Use read-only decay computation — no storage writes
-            results.push_back(compute_decay(&env, asset_id) >= config.eligibility_threshold);
+            let asset = asset_registry_client.get_asset(&asset_id);
+            let score = if asset.deprecation_status != asset_registry::DeprecationStatus::Active {
+                0
+            } else if env.storage().persistent().get::<_, bool>(&frozen_key(asset_id)).unwrap_or(false) {
+                env.storage().persistent().get(&frozen_score_key(asset_id)).unwrap_or(0)
+            } else {
+                compute_read_only_collateral_score(&env, asset_id, &asset.asset_type, &config)
+            };
+            results.push_back(score >= config.eligibility_threshold);
         }
         results
     }
@@ -2581,7 +2777,7 @@ mod tests {
     use soroban_sdk::{
         symbol_short,
         testutils::{storage::Persistent as _, Address as _, Events, Ledger},
-        BytesN, Env, String, Symbol, TryIntoVal,
+        Bytes, BytesN, Env, String, Symbol, TryIntoVal,
     };
 
     fn setup<'a>(
@@ -3410,6 +3606,17 @@ mod tests {
     #[test]
     fn test_update_max_history_zero_rejected() {
         let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, _, _, admin) = setup(&env, 0);
+        let result = client.try_update_max_history(&admin, &0);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::InvalidConfig as u32,
+            ))),
+        );
+    }
 
     #[test]
     fn test_set_task_weight_configures_custom_weight() {
@@ -3528,16 +3735,119 @@ mod tests {
         assert_eq!(client.get_collateral_score(&asset_id1), 10);
         assert_eq!(client.get_collateral_score(&asset_id2), 50);
     }
+
+    #[test]
+    fn test_update_scoring_weights_admin_only() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, _, _, _) = setup(&env, 0);
+        let outsider = Address::generate(&env);
+        let weights = Bytes::from_slice(
+            &env,
+            b"{\"low\":80,\"medium\":100,\"high\":140,\"medium_threshold\":4,\"high_threshold\":10,\"window_days\":365}",
+        );
+
+        let result = client.try_update_scoring_weights(&outsider, &symbol_short!("GENSET"), &weights);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::UnauthorizedAdmin as u32,
+            ))),
+        );
+    }
+
+    #[test]
+    fn test_update_scoring_weights_rejects_invalid_json_shape() {
+        let env = Env::default();
         env.mock_all_auths();
 
         let (client, _, _, admin) = setup(&env, 0);
-        let result = client.try_update_max_history(&admin, &0);
+        let invalid = Bytes::from_slice(&env, b"{\"low\":80,\"medium\":100}");
+
+        let result = client.try_update_scoring_weights(&admin, &symbol_short!("GENSET"), &invalid);
         assert_eq!(
             result,
             Err(Ok(soroban_sdk::Error::from_contract_error(
                 ContractError::InvalidConfig as u32,
             ))),
         );
+    }
+
+    #[test]
+    fn test_get_scoring_weights_returns_stored_bytes() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, _, _, admin) = setup(&env, 0);
+        let weights = Bytes::from_slice(
+            &env,
+            b"{\"low\":80,\"medium\":100,\"high\":140,\"medium_threshold\":4,\"high_threshold\":10,\"window_days\":365}",
+        );
+
+        client.update_scoring_weights(&admin, &symbol_short!("GENSET"), &weights);
+        assert_eq!(client.get_scoring_weights(&symbol_short!("GENSET")), weights);
+    }
+
+    #[test]
+    fn test_dynamic_scoring_weights_apply_low_frequency_penalty() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, engineer_registry_client, admin) = setup(&env, 0);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
+
+        let weights = Bytes::from_slice(
+            &env,
+            b"{\"low\":80,\"medium\":100,\"high\":140,\"medium_threshold\":4,\"high_threshold\":10,\"window_days\":365}",
+        );
+        client.update_scoring_weights(&admin, &symbol_short!("GENSET"), &weights);
+
+        for _ in 0..3 {
+            client.submit_maintenance(
+                &asset_id,
+                &symbol_short!("FILTER"),
+                &String::from_str(&env, "frequency test"),
+                &engineer,
+            );
+            env.ledger().with_mut(|li| li.timestamp += 1);
+        }
+
+        // Base score is 15; low-frequency multiplier is 80%.
+        assert_eq!(client.get_collateral_score(&asset_id), 12);
+    }
+
+    #[test]
+    fn test_dynamic_scoring_weights_apply_high_frequency_bonus() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, engineer_registry_client, admin) = setup(&env, 0);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
+
+        let weights = Bytes::from_slice(
+            &env,
+            b"{\"low\":80,\"medium\":100,\"high\":140,\"medium_threshold\":4,\"high_threshold\":10,\"window_days\":365}",
+        );
+        client.update_scoring_weights(&admin, &symbol_short!("GENSET"), &weights);
+
+        for _ in 0..10 {
+            client.submit_maintenance(
+                &asset_id,
+                &symbol_short!("FILTER"),
+                &String::from_str(&env, "high frequency test"),
+                &engineer,
+            );
+            env.ledger().with_mut(|li| li.timestamp += 1);
+        }
+
+        // Base score is 50; high-frequency multiplier is 140%, capped at 70 here.
+        assert_eq!(client.get_collateral_score(&asset_id), 70);
+        assert!(client.is_collateral_eligible(&asset_id));
     }
 
     #[test]
@@ -4733,7 +5043,8 @@ mod tests {
 
         let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
         let engineer = register_engineer(&env, &engineer_registry_client);
-        let known_id = register_asset(&env, &asset_registry_client);
+        let (known_id, known_owner) = register_asset(&env, &asset_registry_client);
+        client.authorize_engineer(&known_owner, &known_id, &engineer);
         client.submit_maintenance(
             &known_id,
             &symbol_short!("ENGINE"),
@@ -8509,7 +8820,7 @@ mod tests {
         env.mock_all_auths();
 
         let (lifecycle, asset_registry, eng_registry, _admin) = setup(&env, 10);
-        let asset_id = register_asset(&env, &asset_registry);
+        let (asset_id, _asset_owner) = register_asset(&env, &asset_registry);
         let engineer = Address::generate(&env);
         let cred_hash = BytesN::from_array(&env, &[1u8; 32]);
         let issuer = Address::generate(&env);
@@ -8548,7 +8859,7 @@ mod tests {
         env.mock_all_auths();
 
         let (client, _, _, admin) = setup(&env, 200);
-        
+
         client.update_max_history(&admin, &500);
 
         let config: Config = env.as_contract(&client.address, || {
@@ -8600,13 +8911,14 @@ mod tests {
         env.mock_all_auths();
 
         let (client, asset_registry_client, engineer_registry_client, admin) = setup(&env, 2);
-        let asset_id = register_asset(&env, &asset_registry_client);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
         let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
 
         // Submit 2 maintenance records (at limit)
         client.submit_maintenance(&asset_id, &symbol_short!("OIL_CHG"), &String::from_str(&env, "1"), &engineer);
         client.submit_maintenance(&asset_id, &symbol_short!("OIL_CHG"), &String::from_str(&env, "2"), &engineer);
-        
+
         assert_eq!(client.get_maintenance_history(&asset_id).len(), 2);
 
         // Reduce max_history to 1
@@ -8614,7 +8926,7 @@ mod tests {
 
         // Submit third record - should prune oldest
         client.submit_maintenance(&asset_id, &symbol_short!("OIL_CHG"), &String::from_str(&env, "3"), &engineer);
-        
+
         // History should still be at most 1 (or pruned to 1)
         let history = client.get_maintenance_history(&asset_id);
         assert!(history.len() <= 1, "History should not exceed new max_history limit");
@@ -8641,6 +8953,23 @@ mod tests {
     #[test]
     fn test_reputation_zero_halves_score_increment() {
         // reputation=0 → multiplier 0.5× → 5 * 500/1000 = 2 per submission
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
+
+        client.submit_maintenance(
+            &asset_id,
+            &symbol_short!("OIL_CHG"),
+            &String::from_str(&env, "oil change"),
+            &engineer,
+        );
+        assert_eq!(client.get_collateral_score(&asset_id), 2);
+    }
+
     // --- Health Snapshot Tests ---
 
     #[test]
@@ -8682,30 +9011,6 @@ mod tests {
     #[test]
     fn test_reputation_500_gives_base_score_increment() {
         // reputation=500 → multiplier 1.0× → 5 * 1000/1000 = 5 per submission
-        client.submit_maintenance(
-            &asset_id,
-            &symbol_short!("OIL_CHG"),
-            &String::from_str(&env, "Oil change"),
-            &engineer,
-        );
-        client.submit_maintenance(
-            &asset_id,
-            &symbol_short!("FILTER"),
-            &String::from_str(&env, "Filter"),
-            &engineer,
-        );
-
-        let service_ts = env.ledger().timestamp();
-        let snapshot = client.take_health_snapshot(&asset_id);
-
-        assert!(snapshot.score > 0, "score should be positive after maintenance");
-        assert_eq!(snapshot.maintenance_count, 2);
-        assert_eq!(snapshot.last_service_date, service_ts);
-        assert_eq!(snapshot.timestamp, service_ts);
-    }
-
-    #[test]
-    fn test_get_health_snapshots_accumulates() {
         let env = Env::default();
         env.mock_all_auths();
 
@@ -8723,6 +9028,43 @@ mod tests {
             &engineer,
         );
         assert_eq!(client.get_collateral_score(&asset_id), 5);
+    }
+
+    #[test]
+    fn test_get_health_snapshots_accumulates() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
+
+        client.submit_maintenance(
+            &asset_id,
+            &symbol_short!("OIL_CHG"),
+            &String::from_str(&env, "First service"),
+            &engineer,
+        );
+        client.take_health_snapshot(&asset_id);
+
+        env.ledger().with_mut(|li| li.timestamp += 1000);
+
+        client.submit_maintenance(
+            &asset_id,
+            &symbol_short!("FILTER"),
+            &String::from_str(&env, "Second service"),
+            &engineer,
+        );
+        client.take_health_snapshot(&asset_id);
+
+        let snapshots = client.get_health_snapshots(&asset_id);
+        assert_eq!(snapshots.len(), 2, "should have one snapshot per take_health_snapshot call");
+        assert!(
+            snapshots.get(1).unwrap().timestamp > snapshots.get(0).unwrap().timestamp,
+            "snapshots should be in chronological order"
+        );
+        assert_eq!(snapshots.get(1).unwrap().maintenance_count, 2);
     }
 
     #[test]
@@ -8749,8 +9091,6 @@ mod tests {
 
     #[test]
     fn test_higher_reputation_yields_higher_collateral_score() {
-        // Two engineers submit identical maintenance; higher-reputation engineer
-        // should result in a higher collateral score on their asset.
         let env = Env::default();
         env.mock_all_auths();
 
@@ -8760,20 +9100,7 @@ mod tests {
         let (asset_b, owner_b) = register_asset(&env, &asset_registry_client);
 
         let eng_low = register_engineer(&env, &engineer_registry_client);
-        // eng_high needs its own issuer/admin setup — reuse the existing helper indirectly
-        let eng_high = Address::generate(&env);
-        let issuer = Address::generate(&env);
-        let admin_h = Address::generate(&env);
-        engineer_registry_client.initialize_admin(&admin_h, &admin_h);
-        engineer_registry_client.add_trusted_issuer(&admin_h, &issuer);
-        engineer_registry_client.register_engineer(
-            &eng_high,
-            &BytesN::from_array(&env, &[7u8; 32]),
-            &issuer,
-            &31_536_000,
-        );
-
-        // eng_low: reputation 0, eng_high: reputation 1000
+        let eng_high = register_engineer(&env, &engineer_registry_client);
         engineer_registry_client.update_reputation(&eng_high, &1000);
 
         client.authorize_engineer(&owner_a, &asset_a, &eng_low);
@@ -8794,40 +9121,7 @@ mod tests {
 
         let score_low = client.get_collateral_score(&asset_a);
         let score_high = client.get_collateral_score(&asset_b);
-        assert!(
-            score_high > score_low,
-            "Higher reputation engineer should yield higher collateral score: {} vs {}",
-            score_high,
-            score_low,
-        );
-    }
-        client.submit_maintenance(
-            &asset_id,
-            &symbol_short!("OIL_CHG"),
-            &String::from_str(&env, "First service"),
-            &engineer,
-        );
-
-        client.take_health_snapshot(&asset_id);
-
-        env.ledger().with_mut(|li| li.timestamp += 1000);
-
-        client.submit_maintenance(
-            &asset_id,
-            &symbol_short!("FILTER"),
-            &String::from_str(&env, "Second service"),
-            &engineer,
-        );
-
-        client.take_health_snapshot(&asset_id);
-
-        let snapshots = client.get_health_snapshots(&asset_id);
-        assert_eq!(snapshots.len(), 2, "should have one snapshot per take_health_snapshot call");
-        assert!(
-            snapshots.get(1).unwrap().timestamp > snapshots.get(0).unwrap().timestamp,
-            "snapshots should be in chronological order"
-        );
-        assert_eq!(snapshots.get(1).unwrap().maintenance_count, 2);
+        assert!(score_high > score_low);
     }
 
     #[test]
@@ -8851,6 +9145,8 @@ mod tests {
 
         let result = client.try_take_health_snapshot(&999u64);
         assert!(result.is_err(), "should error for unknown asset");
+    }
+
     // --- Deprecation: collateral score tests ---
 
     #[test]
@@ -8887,6 +9183,8 @@ mod tests {
         assert_eq!(lifecycle.get_collateral_score(&asset_id_1), 0);
         // Asset 2 is active, score is 0 simply because no maintenance has been submitted
         assert_eq!(lifecycle.get_collateral_score(&asset_id_2), 0);
+    }
+
     // --- Issue #830: set_max_notes_length ---
 
     #[test]
