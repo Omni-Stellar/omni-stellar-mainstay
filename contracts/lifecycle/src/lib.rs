@@ -1455,13 +1455,9 @@ impl Lifecycle {
     /// - [`ContractError::NotInitialized`] if contract has not been initialized
     pub fn decay_score(env: Env, asset_id: u64) -> u32 {
         ensure_not_paused(&env);
-        // Frozen (decommissioned) assets do not decay; return the frozen score.
+        // Frozen (decommissioned) assets are not eligible for collateral; return 0.
         if env.storage().persistent().get::<_, bool>(&frozen_key(asset_id)).unwrap_or(false) {
-            return env
-                .storage()
-                .persistent()
-                .get(&frozen_score_key(asset_id))
-                .unwrap_or(0);
+            return 0;
         }
         let config: Config = env
             .storage()
@@ -1636,18 +1632,14 @@ impl Lifecycle {
             .persistent()
             .get::<_, Config>(&CONFIG)
             .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
-        // Deprecated assets are not eligible for collateral — return 0 immediately.
+        // Deprecated or decommissioned assets are not eligible for collateral — return 0 immediately.
         let asset = asset_registry::AssetRegistryClient::new(&env, &asset_registry).get_asset(&asset_id);
         if asset.deprecation_status != asset_registry::DeprecationStatus::Active {
             return 0;
         }
-        // Frozen (decommissioned) assets return the score captured at decommission time.
+        // Frozen (decommissioned) assets are not eligible — return 0.
         if env.storage().persistent().get::<_, bool>(&frozen_key(asset_id)).unwrap_or(false) {
-            return env
-                .storage()
-                .persistent()
-                .get(&frozen_score_key(asset_id))
-                .unwrap_or(0);
+            return 0;
         }
         // Compute score from maintenance history (recency-weighted, decreases as records age).
         let history_score = compute_decay(&env, asset_id);
@@ -1724,11 +1716,21 @@ impl Lifecycle {
         let client = asset_registry::AssetRegistryClient::new(&env, &asset_registry);
         let mut results: Vec<(u64, u32)> = Vec::new(&env);
         for asset_id in asset_ids.iter() {
-            if client.try_get_asset(&asset_id).is_err() {
-                continue;
+            if let Ok(asset) = client.try_get_asset(&asset_id) {
+                // Check deprecation status first
+                if asset.deprecation_status != asset_registry::DeprecationStatus::Active {
+                    results.push_back((asset_id, 0));
+                    continue;
+                }
+                // Check if frozen (decommissioned)
+                if env.storage().persistent().get::<_, bool>(&frozen_key(asset_id)).unwrap_or(false) {
+                    results.push_back((asset_id, 0));
+                    continue;
+                }
+                // Compute score normally
+                let score = apply_decay(&env, asset_id, false, false, config.max_history);
+                results.push_back((asset_id, score));
             }
-            let score = apply_decay(&env, asset_id, false, false, config.max_history);
-            results.push_back((asset_id, score));
         }
         results
     }
@@ -1814,6 +1816,17 @@ impl Lifecycle {
             .persistent()
             .get(&CONFIG)
             .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
+
+        // Check asset deprecation status first
+        let asset = asset_registry::AssetRegistryClient::new(&env, &asset_registry).get_asset(&asset_id);
+        if asset.deprecation_status != asset_registry::DeprecationStatus::Active {
+            return false;
+        }
+
+        // Check if asset is frozen (decommissioned)
+        if env.storage().persistent().get::<_, bool>(&frozen_key(asset_id)).unwrap_or(false) {
+            return false;
+        }
 
         // Use read-only decay computation since we already verified asset exists
         let score = compute_decay(&env, asset_id);
