@@ -33,7 +33,17 @@ pub enum ContractError {
     /// Asset has already been deprecated and cannot be deprecated again.
     AssetAlreadyDeprecated = 17,
     /// The batch exceeds the maximum allowed size.
-    BatchTooLarge = 17,
+    BatchTooLarge = 18,
+    /// Asset is currently locked as collateral and cannot be transferred.
+    AssetLocked = 19,
+    /// Caller is not the authorized lending contract that holds the lien.
+    UnauthorizedLender = 20,
+    /// Asset is not locked; unlock operation is invalid.
+    AssetNotLocked = 21,
+    /// Loan ID does not match the one recorded when the asset was locked.
+    LoanIdMismatch = 22,
+    /// No lending contract has been registered; lock/unlock is not available.
+    LendingContractNotSet = 23,
 }
 
 #[contracttype]
@@ -51,6 +61,14 @@ pub struct Asset {
     pub metadata_updated_at: u64,
     /// Soft lifecycle status set by the owner. Defaults to `Active` on registration.
     pub deprecation_status: DeprecationStatus,
+    /// Whether this asset is currently locked as collateral under a lien.
+    /// While `true`, ownership transfers are blocked.
+    pub is_locked: bool,
+    /// The lending contract address that placed the lien, if any.
+    pub lender: Option<Address>,
+    /// The loan ID associated with the lien, used to verify the correct loan
+    /// releases the lock on repayment.
+    pub loan_id: Option<u64>,
 }
 
 #[contracttype]
@@ -121,6 +139,11 @@ const ADMIN_KEY: Symbol = symbol_short!("ADMIN");
 const ASSET_TYPE_PREFIX: Symbol = symbol_short!("AST_TYPE");
 const PENDING_ADMIN_KEY: Symbol = symbol_short!("PADMIN");
 const DECOMM_PREFIX: Symbol = symbol_short!("DECOMM");
+
+/// Storage key for the authorized lending contract address.
+/// Only the contract stored under this key may call `lock_asset_as_collateral`
+/// and `unlock_asset_from_collateral`.
+const LENDING_CONTRACT_KEY: Symbol = symbol_short!("LEND_CTR");
 
 /// Maximum number of assets that may be registered in a single batch call.
 const MAX_BATCH_SIZE: u32 = 50;
@@ -530,6 +553,9 @@ impl AssetRegistry {
             registered_at: env.ledger().timestamp(),
             metadata_updated_at: env.ledger().timestamp(),
             deprecation_status: DeprecationStatus::Active,
+            is_locked: false,
+            lender: None,
+            loan_id: None,
         };
         env.storage().persistent().set(&asset_key(id), &asset);
         env.storage()
@@ -635,6 +661,9 @@ impl AssetRegistry {
                 registered_at: env.ledger().timestamp(),
                 metadata_updated_at: env.ledger().timestamp(),
                 deprecation_status: DeprecationStatus::Active,
+                is_locked: false,
+                lender: None,
+                loan_id: None,
             };
 
             env.storage().persistent().set(&asset_key(id), &asset);
@@ -1363,6 +1392,11 @@ impl AssetRegistry {
             panic_with_error!(&env, ContractError::SameOwner);
         }
 
+        // Block transfers while the asset is locked as collateral under a lien.
+        if asset.is_locked {
+            panic_with_error!(&env, ContractError::AssetLocked);
+        }
+
         // Move dedup key to new owner
         let hash: BytesN<32> = env
             .crypto()
@@ -1393,6 +1427,183 @@ impl AssetRegistry {
         env.events().publish(
             (symbol_short!("TRANSFER"), asset_id),
             (current_owner, new_owner, env.ledger().timestamp()),
+        );
+    }
+
+    /// Admin-only function to register the authorized lending contract address.
+    ///
+    /// Only the address stored here may call `lock_asset_as_collateral` and
+    /// `unlock_asset_from_collateral`. This must be called once after the lending
+    /// contract is deployed before any collateral locking can take place.
+    ///
+    /// # Arguments
+    /// * `admin`            - The current admin (must match stored admin)
+    /// * `lending_contract` - The lending contract's address
+    ///
+    /// # Panics
+    /// - [`ContractError::UnauthorizedAdmin`] if `admin` is not the stored admin
+    pub fn set_lending_contract(env: Env, admin: Address, lending_contract: Address) {
+        ensure_not_paused(&env);
+        admin.require_auth();
+
+        let stored_admin: Address = Self::get_admin(env.clone());
+        if stored_admin != admin {
+            panic_with_error!(&env, ContractError::UnauthorizedAdmin);
+        }
+
+        env.storage()
+            .persistent()
+            .set(&LENDING_CONTRACT_KEY, &lending_contract);
+        env.storage()
+            .persistent()
+            .extend_ttl(&LENDING_CONTRACT_KEY, TTL_THRESHOLD, TTL_TARGET);
+
+        env.events().publish(
+            (symbol_short!("SET_LEND"), admin),
+            (lending_contract, env.ledger().timestamp()),
+        );
+    }
+
+    /// Get the currently registered lending contract address, if any.
+    pub fn get_lending_contract(env: Env) -> Option<Address> {
+        env.storage().persistent().get(&LENDING_CONTRACT_KEY)
+    }
+
+    /// Lock an asset as collateral under a lien.
+    ///
+    /// Only the registered lending contract may call this function. The asset
+    /// owner must already have authorized the lending contract to place the lien
+    /// (typically via an `approve` or similar call on the lending side).
+    ///
+    /// Once locked, `transfer_asset` will reject all ownership transfers until
+    /// `unlock_asset_from_collateral` is called with the matching `loan_id`.
+    ///
+    /// # Arguments
+    /// * `lender`   - The lending contract's address (must match the registered address)
+    /// * `asset_id` - The unique identifier of the asset to lock
+    /// * `loan_id`  - The lending contract's loan ID associated with this lien
+    ///
+    /// # Panics
+    /// - [`ContractError::LendingContractNotSet`] if no lending contract has been registered
+    /// - [`ContractError::UnauthorizedLender`] if `lender` is not the registered lending contract
+    /// - [`ContractError::AssetNotFound`] if no asset exists with the given ID
+    /// - [`ContractError::AssetLocked`] if the asset is already locked
+    /// - [`ContractError::AssetDecommissioned`] if the asset has been decommissioned
+    pub fn lock_asset_as_collateral(env: Env, lender: Address, asset_id: u64, loan_id: u64) {
+        ensure_not_paused(&env);
+        lender.require_auth();
+
+        // Verify caller is the registered lending contract
+        let registered_lender: Address = env
+            .storage()
+            .persistent()
+            .get(&LENDING_CONTRACT_KEY)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::LendingContractNotSet));
+
+        if lender != registered_lender {
+            panic_with_error!(&env, ContractError::UnauthorizedLender);
+        }
+
+        let mut asset: Asset = env
+            .storage()
+            .persistent()
+            .get(&asset_key(asset_id))
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::AssetNotFound));
+
+        // Decommissioned assets cannot be used as collateral
+        let decomm_key = decommissioned_key(asset_id);
+        if env
+            .storage()
+            .persistent()
+            .get::<_, bool>(&decomm_key)
+            .unwrap_or(false)
+        {
+            panic_with_error!(&env, ContractError::AssetDecommissioned);
+        }
+
+        if asset.is_locked {
+            panic_with_error!(&env, ContractError::AssetLocked);
+        }
+
+        asset.is_locked = true;
+        asset.lender = Some(lender.clone());
+        asset.loan_id = Some(loan_id);
+
+        env.storage().persistent().set(&asset_key(asset_id), &asset);
+        env.storage()
+            .persistent()
+            .extend_ttl(&asset_key(asset_id), TTL_THRESHOLD, TTL_TARGET);
+
+        env.events().publish(
+            (symbol_short!("LOCK_AST"), asset_id),
+            (lender, loan_id, env.ledger().timestamp()),
+        );
+    }
+
+    /// Unlock an asset from a collateral lien.
+    ///
+    /// Only the registered lending contract that originally placed the lien may
+    /// call this function, and only with the same `loan_id` that was used when
+    /// locking. This is typically called on loan repayment or liquidation.
+    ///
+    /// # Arguments
+    /// * `lender`   - The lending contract's address (must match the registered address and
+    ///                the address stored when the asset was locked)
+    /// * `asset_id` - The unique identifier of the asset to unlock
+    /// * `loan_id`  - The lending contract's loan ID — must match the one recorded at lock time
+    ///
+    /// # Panics
+    /// - [`ContractError::LendingContractNotSet`] if no lending contract has been registered
+    /// - [`ContractError::UnauthorizedLender`] if `lender` is not the registered lending contract
+    /// - [`ContractError::AssetNotFound`] if no asset exists with the given ID
+    /// - [`ContractError::AssetNotLocked`] if the asset is not currently locked
+    /// - [`ContractError::LoanIdMismatch`] if `loan_id` does not match the recorded lien
+    pub fn unlock_asset_from_collateral(env: Env, lender: Address, asset_id: u64, loan_id: u64) {
+        ensure_not_paused(&env);
+        lender.require_auth();
+
+        // Verify caller is the registered lending contract
+        let registered_lender: Address = env
+            .storage()
+            .persistent()
+            .get(&LENDING_CONTRACT_KEY)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::LendingContractNotSet));
+
+        if lender != registered_lender {
+            panic_with_error!(&env, ContractError::UnauthorizedLender);
+        }
+
+        let mut asset: Asset = env
+            .storage()
+            .persistent()
+            .get(&asset_key(asset_id))
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::AssetNotFound));
+
+        if !asset.is_locked {
+            panic_with_error!(&env, ContractError::AssetNotLocked);
+        }
+
+        // Verify that this lender/loan combination owns the lien
+        let stored_loan_id = asset
+            .loan_id
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::AssetNotLocked));
+
+        if stored_loan_id != loan_id {
+            panic_with_error!(&env, ContractError::LoanIdMismatch);
+        }
+
+        asset.is_locked = false;
+        asset.lender = None;
+        asset.loan_id = None;
+
+        env.storage().persistent().set(&asset_key(asset_id), &asset);
+        env.storage()
+            .persistent()
+            .extend_ttl(&asset_key(asset_id), TTL_THRESHOLD, TTL_TARGET);
+
+        env.events().publish(
+            (symbol_short!("UNLCK_AS"), asset_id),
+            (lender, loan_id, env.ledger().timestamp()),
         );
     }
 
@@ -5480,5 +5691,349 @@ mod tests {
         let asset_id = reg(&client, &env, symbol_short!("TURBINE"), String::from_str(&env, "Turbine A"), &owner);
 
         assert_eq!(client.get_asset(&asset_id).deprecation_status, DeprecationStatus::Active);
+    }
+
+    // ─── Asset locking (collateral lien) tests ──────────────────────────────────
+
+    /// Helper: set up env, contract, admin + one GENSET asset.
+    fn setup_with_asset(env: &Env) -> (AssetRegistryClient, Address, Address, u64) {
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(env, &contract_id);
+
+        let admin = Address::generate(env);
+        client.initialize_admin(&admin, &admin);
+        client.add_asset_type(&admin, &symbol_short!("GENSET"));
+
+        let owner = Address::generate(env);
+        let asset_id = reg(
+            &client,
+            env,
+            symbol_short!("GENSET"),
+            String::from_str(env, "CAT-3516"),
+            &owner,
+        );
+
+        (client, admin, owner, asset_id)
+    }
+
+    #[test]
+    fn test_new_asset_is_not_locked() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _admin, _owner, asset_id) = setup_with_asset(&env);
+
+        let asset = client.get_asset(&asset_id);
+        assert!(!asset.is_locked, "freshly registered asset must not be locked");
+        assert!(asset.lender.is_none(), "freshly registered asset must have no lender");
+        assert!(asset.loan_id.is_none(), "freshly registered asset must have no loan_id");
+    }
+
+    #[test]
+    fn test_set_lending_contract_requires_admin() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, _owner, _asset_id) = setup_with_asset(&env);
+
+        let lending_contract = Address::generate(&env);
+        // Should succeed — admin calling
+        client.set_lending_contract(&admin, &lending_contract);
+
+        assert_eq!(
+            client.get_lending_contract(),
+            Some(lending_contract),
+            "lending contract must be retrievable after set_lending_contract"
+        );
+    }
+
+    #[test]
+    fn test_set_lending_contract_rejects_non_admin() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _admin, owner, _asset_id) = setup_with_asset(&env);
+
+        let lending_contract = Address::generate(&env);
+        let result = client.try_set_lending_contract(&owner, &lending_contract);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::UnauthorizedAdmin as u32
+            ))),
+            "non-admin must not be able to set the lending contract"
+        );
+    }
+
+    #[test]
+    fn test_lock_asset_as_collateral_succeeds() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, _owner, asset_id) = setup_with_asset(&env);
+
+        let lending_contract = Address::generate(&env);
+        client.set_lending_contract(&admin, &lending_contract);
+
+        let loan_id: u64 = 42;
+        client.lock_asset_as_collateral(&lending_contract, &asset_id, &loan_id);
+
+        let asset = client.get_asset(&asset_id);
+        assert!(asset.is_locked, "asset must be locked after lock_asset_as_collateral");
+        assert_eq!(asset.lender, Some(lending_contract), "lender must be stored on the asset");
+        assert_eq!(asset.loan_id, Some(loan_id), "loan_id must be stored on the asset");
+    }
+
+    #[test]
+    fn test_lock_asset_rejects_when_no_lending_contract_set() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _admin, _owner, asset_id) = setup_with_asset(&env);
+
+        let fake_lender = Address::generate(&env);
+        let result = client.try_lock_asset_as_collateral(&fake_lender, &asset_id, &1u64);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::LendingContractNotSet as u32
+            ))),
+            "lock must fail when no lending contract is registered"
+        );
+    }
+
+    #[test]
+    fn test_lock_asset_rejects_unauthorized_lender() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, _owner, asset_id) = setup_with_asset(&env);
+
+        let lending_contract = Address::generate(&env);
+        let impostor = Address::generate(&env);
+        client.set_lending_contract(&admin, &lending_contract);
+
+        let result = client.try_lock_asset_as_collateral(&impostor, &asset_id, &1u64);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::UnauthorizedLender as u32
+            ))),
+            "lock must fail when caller is not the registered lending contract"
+        );
+    }
+
+    #[test]
+    fn test_lock_asset_rejects_already_locked() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, _owner, asset_id) = setup_with_asset(&env);
+
+        let lending_contract = Address::generate(&env);
+        client.set_lending_contract(&admin, &lending_contract);
+
+        client.lock_asset_as_collateral(&lending_contract, &asset_id, &1u64);
+
+        // Attempt to lock again
+        let result = client.try_lock_asset_as_collateral(&lending_contract, &asset_id, &2u64);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::AssetLocked as u32
+            ))),
+            "locking an already-locked asset must return AssetLocked"
+        );
+    }
+
+    #[test]
+    fn test_lock_nonexistent_asset_returns_not_found() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, _owner, _asset_id) = setup_with_asset(&env);
+
+        let lending_contract = Address::generate(&env);
+        client.set_lending_contract(&admin, &lending_contract);
+
+        let result = client.try_lock_asset_as_collateral(&lending_contract, &9999u64, &1u64);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::AssetNotFound as u32
+            ))),
+            "locking a non-existent asset must return AssetNotFound"
+        );
+    }
+
+    #[test]
+    fn test_unlock_asset_from_collateral_succeeds() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, _owner, asset_id) = setup_with_asset(&env);
+
+        let lending_contract = Address::generate(&env);
+        client.set_lending_contract(&admin, &lending_contract);
+
+        let loan_id: u64 = 7;
+        client.lock_asset_as_collateral(&lending_contract, &asset_id, &loan_id);
+        client.unlock_asset_from_collateral(&lending_contract, &asset_id, &loan_id);
+
+        let asset = client.get_asset(&asset_id);
+        assert!(!asset.is_locked, "asset must not be locked after unlock_asset_from_collateral");
+        assert!(asset.lender.is_none(), "lender must be cleared after unlock");
+        assert!(asset.loan_id.is_none(), "loan_id must be cleared after unlock");
+    }
+
+    #[test]
+    fn test_unlock_asset_rejects_wrong_loan_id() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, _owner, asset_id) = setup_with_asset(&env);
+
+        let lending_contract = Address::generate(&env);
+        client.set_lending_contract(&admin, &lending_contract);
+
+        client.lock_asset_as_collateral(&lending_contract, &asset_id, &10u64);
+
+        let result = client.try_unlock_asset_from_collateral(&lending_contract, &asset_id, &99u64);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::LoanIdMismatch as u32
+            ))),
+            "unlock with wrong loan_id must return LoanIdMismatch"
+        );
+    }
+
+    #[test]
+    fn test_unlock_asset_rejects_when_not_locked() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, _owner, asset_id) = setup_with_asset(&env);
+
+        let lending_contract = Address::generate(&env);
+        client.set_lending_contract(&admin, &lending_contract);
+
+        let result = client.try_unlock_asset_from_collateral(&lending_contract, &asset_id, &1u64);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::AssetNotLocked as u32
+            ))),
+            "unlocking an unlocked asset must return AssetNotLocked"
+        );
+    }
+
+    #[test]
+    fn test_unlock_rejects_unauthorized_lender() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, _owner, asset_id) = setup_with_asset(&env);
+
+        let lending_contract = Address::generate(&env);
+        let impostor = Address::generate(&env);
+        client.set_lending_contract(&admin, &lending_contract);
+        client.lock_asset_as_collateral(&lending_contract, &asset_id, &1u64);
+
+        let result = client.try_unlock_asset_from_collateral(&impostor, &asset_id, &1u64);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::UnauthorizedLender as u32
+            ))),
+            "unlock must fail when caller is not the registered lending contract"
+        );
+    }
+
+    #[test]
+    fn test_transfer_blocked_when_asset_locked() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, owner, asset_id) = setup_with_asset(&env);
+
+        let lending_contract = Address::generate(&env);
+        client.set_lending_contract(&admin, &lending_contract);
+        client.lock_asset_as_collateral(&lending_contract, &asset_id, &5u64);
+
+        let new_owner = Address::generate(&env);
+        let result = client.try_transfer_asset(&asset_id, &owner, &new_owner);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::AssetLocked as u32
+            ))),
+            "transfer must be blocked while asset is locked as collateral"
+        );
+
+        // Ownership must remain unchanged
+        assert_eq!(client.get_asset(&asset_id).owner, owner);
+    }
+
+    #[test]
+    fn test_transfer_allowed_after_unlock() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, owner, asset_id) = setup_with_asset(&env);
+
+        let lending_contract = Address::generate(&env);
+        client.set_lending_contract(&admin, &lending_contract);
+
+        let loan_id: u64 = 3;
+        client.lock_asset_as_collateral(&lending_contract, &asset_id, &loan_id);
+        client.unlock_asset_from_collateral(&lending_contract, &asset_id, &loan_id);
+
+        let new_owner = Address::generate(&env);
+        client.transfer_asset(&asset_id, &owner, &new_owner);
+
+        assert_eq!(
+            client.get_asset(&asset_id).owner,
+            new_owner,
+            "transfer must succeed after the lien is released"
+        );
+    }
+
+    #[test]
+    fn test_lock_and_unlock_emits_events() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, _owner, asset_id) = setup_with_asset(&env);
+
+        let lending_contract = Address::generate(&env);
+        client.set_lending_contract(&admin, &lending_contract);
+
+        let loan_id: u64 = 77;
+        client.lock_asset_as_collateral(&lending_contract, &asset_id, &loan_id);
+        assert_eq!(env.events().all().len(), 1, "lock must emit exactly one event");
+
+        client.unlock_asset_from_collateral(&lending_contract, &asset_id, &loan_id);
+        assert_eq!(env.events().all().len(), 1, "unlock must emit exactly one event");
+    }
+
+    #[test]
+    fn test_lock_decommissioned_asset_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, _owner, asset_id) = setup_with_asset(&env);
+
+        let lending_contract = Address::generate(&env);
+        client.set_lending_contract(&admin, &lending_contract);
+
+        // Decommission the asset first
+        client.decommission_asset(&admin, &asset_id);
+
+        let result = client.try_lock_asset_as_collateral(&lending_contract, &asset_id, &1u64);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::AssetDecommissioned as u32
+            ))),
+            "decommissioned assets must not be lockable as collateral"
+        );
+    }
+
+    #[test]
+    fn test_get_lending_contract_returns_none_when_not_set() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _admin, _owner, _asset_id) = setup_with_asset(&env);
+
+        assert_eq!(
+            client.get_lending_contract(),
+            None,
+            "get_lending_contract must return None before set_lending_contract is called"
+        );
     }
 }
