@@ -281,11 +281,9 @@ mod engineer_registry {
     #[allow(dead_code)]
     #[contractclient(name = "EngineerRegistryClient")]
     pub trait EngineerRegistry {
-        fn verify_engineer(env: Env, engineer: Address) -> Option<bool>;
-        fn batch_verify_engineers(env: Env, engineers: Vec<Address>) -> Vec<bool>;
-        fn get_reputation(env: Env, engineer: Address) -> u32;
         fn verify_engineer(env: Env, engineer: Address) -> CredentialStatus;
         fn batch_verify_engineers(env: Env, engineers: Vec<Address>) -> Vec<CredentialStatus>;
+        fn get_reputation(env: Env, engineer: Address) -> u32;
         fn get_credential_status(env: Env, engineer: Address) -> CredentialStatus;
     }
 }
@@ -1158,9 +1156,10 @@ impl Lifecycle {
         use engineer_registry::CredentialStatus;
         let status = registry.get_credential_status(&engineer);
         if status != CredentialStatus::Valid && status != CredentialStatus::GracePeriod {
-        let status = registry.verify_engineer(&engineer);
-        if status != CredentialStatus::Valid {
-            panic_with_error!(&env, ContractError::UnauthorizedEngineer);
+            let status = registry.verify_engineer(&engineer);
+            if status != CredentialStatus::Valid {
+                panic_with_error!(&env, ContractError::UnauthorizedEngineer);
+            }
         }
         require_engineer_authorized(&env, asset_id, &engineer);
 
@@ -1360,9 +1359,10 @@ impl Lifecycle {
         use engineer_registry::CredentialStatus;
         let status = engineer_registry_client.get_credential_status(&engineer);
         if status != CredentialStatus::Valid && status != CredentialStatus::GracePeriod {
-        let status = engineer_registry_client.verify_engineer(&engineer);
-        if status != CredentialStatus::Valid {
-            panic_with_error!(&env, ContractError::UnauthorizedEngineer);
+            let status = engineer_registry_client.verify_engineer(&engineer);
+            if status != CredentialStatus::Valid {
+                panic_with_error!(&env, ContractError::UnauthorizedEngineer);
+            }
         }
         require_engineer_authorized(&env, asset_id, &engineer);
 
@@ -8851,6 +8851,8 @@ mod tests {
 
         let result = client.try_take_health_snapshot(&999u64);
         assert!(result.is_err(), "should error for unknown asset");
+    }
+
     // --- Deprecation: collateral score tests ---
 
     #[test]
@@ -8887,6 +8889,8 @@ mod tests {
         assert_eq!(lifecycle.get_collateral_score(&asset_id_1), 0);
         // Asset 2 is active, score is 0 simply because no maintenance has been submitted
         assert_eq!(lifecycle.get_collateral_score(&asset_id_2), 0);
+    }
+
     // --- Issue #830: set_max_notes_length ---
 
     #[test]

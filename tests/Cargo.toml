@@ -34,3 +34,7 @@ path = "test_emergency_pause.rs"
 [[test]]
 name = "test_admin_transfer"
 path = "test_admin_transfer.rs"
+
+[[test]]
+name = "test_multi_asset_collateral"
+path = "test_multi_asset_collateral.rs"

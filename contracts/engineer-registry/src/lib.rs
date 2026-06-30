@@ -3748,10 +3748,6 @@ mod tests {
 
     #[test]
     fn test_get_reputation_default_is_zero() {
-    // --- Issue #827: get_total_engineer_count ---
-
-    #[test]
-    fn test_get_total_engineer_count_returns_u64() {
         let env = Env::default();
         env.mock_all_auths();
         let (client, admin) = setup(&env);
