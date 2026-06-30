@@ -1830,24 +1830,45 @@ impl Lifecycle {
         results
     }
 
-    /// Returns the full score trend: one (timestamp, score) entry per maintenance event.
-    /// Get the complete score history for an asset.
-    /// Returns one (timestamp, score) entry per maintenance event.
+    /// Returns the full score history (SCHIST) for an asset.
     ///
     /// # Arguments
     /// * `asset_id` - The unique identifier of the asset
+    /// * `offset` - Zero-based start index for pagination
+    /// * `limit` - Maximum number of entries to return (returns empty vec if 0)
     ///
     /// # Returns
-    /// Vec of ScoreEntry containing the complete score trend
+    /// Vec of [`ScoreEntry`] containing the requested page of the score history
     ///
     /// # Panics
     /// - [`ContractError::NotInitialized`] if contract has not been initialized
-    pub fn get_score_history(env: Env, asset_id: u64) -> Vec<ScoreEntry> {
-        env.storage()
+    pub fn get_score_history(env: Env, asset_id: u64, offset: u32, limit: u32) -> Vec<ScoreEntry> {
+        let asset_registry = get_asset_registry_addr(&env);
+        verify_asset_exists(&env, &asset_registry, &asset_id);
+
+        if limit == 0 {
+            return Vec::new(&env);
+        }
+
+        let history: Vec<ScoreEntry> = env
+            .storage()
             .persistent()
             .get(&score_history_key(asset_id))
-            .unwrap_or(Vec::new(&env))
+            .unwrap_or(Vec::new(&env));
+
+        let len = history.len();
+        if offset >= len {
+            return Vec::new(&env);
+        }
+
+        let end = (offset + limit).min(len);
+        let mut page = Vec::new(&env);
+        for i in offset..end {
+            page.push_back(history.get(i).unwrap());
+        }
+        page
     }
+
 
     /// Get the last `n` ScoreEntry items from the score history.
     /// Useful for displaying recent score trends in dashboards.
