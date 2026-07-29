@@ -1,7 +1,7 @@
 #![no_std]
 use shared::error::SharedContractError;
 use shared::validation::require_within_bounds;
-use shared::{extend_persistent_ttl, TTL_THRESHOLD, TTL_TARGET};
+use shared::{extend_persistent_ttl, require_admin, TTL_THRESHOLD, TTL_TARGET};
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, panic_with_error, symbol_short, Address,
     BytesN, Env, String, Symbol, Vec,
@@ -748,9 +748,8 @@ impl EngineerRegistry {
     /// - [`ContractError::UnauthorizedAdmin`] if caller is not the current admin
     /// - [`ContractError::PendingAdminAlreadyExists`] if a pending admin already exists
     pub fn propose_admin(env: Env, admin: Address, new_admin: Address) {
-        admin.require_auth();
         let stored_admin: Address = Self::get_admin(env.clone());
-        if stored_admin != admin {
+        if require_admin(&admin, &stored_admin).is_err() {
             panic_with_error!(&env, ContractError::UnauthorizedAdmin);
         }
         if env.storage().instance().has(&pending_admin_key()) {
@@ -803,9 +802,8 @@ impl EngineerRegistry {
     /// # Panics
     /// - [`ContractError::UnauthorizedAdmin`] if `admin` does not match the stored admin
     pub fn pause(env: Env, admin: Address) {
-        admin.require_auth();
         let stored_admin: Address = Self::get_admin(env.clone());
-        if stored_admin != admin {
+        if require_admin(&admin, &stored_admin).is_err() {
             panic_with_error!(&env, ContractError::UnauthorizedAdmin);
         }
         env.storage().persistent().set(&PAUSED_KEY, &true);
@@ -829,9 +827,8 @@ impl EngineerRegistry {
     /// # Panics
     /// - [`ContractError::UnauthorizedAdmin`] if `admin` does not match the stored admin
     pub fn unpause(env: Env, admin: Address) {
-        admin.require_auth();
         let stored_admin: Address = Self::get_admin(env.clone());
-        if stored_admin != admin {
+        if require_admin(&admin, &stored_admin).is_err() {
             panic_with_error!(&env, ContractError::UnauthorizedAdmin);
         }
         env.storage().persistent().set(&PAUSED_KEY, &false);
@@ -863,9 +860,8 @@ impl EngineerRegistry {
     /// # Panics
     /// - [`ContractError::UnauthorizedAdmin`] if caller is not the current admin
     pub fn set_grace_period(env: Env, admin: Address, secs: u64) {
-        admin.require_auth();
         let stored_admin: Address = Self::get_admin(env.clone());
-        if stored_admin != admin {
+        if require_admin(&admin, &stored_admin).is_err() {
             panic_with_error!(&env, ContractError::UnauthorizedAdmin);
         }
         env.storage().persistent().set(&GRACE_PERIOD_KEY, &secs);
