@@ -4474,6 +4474,22 @@ impl Lifecycle {
         effective_score >= config.min_collateral_score
     }
 
+    /// Get the minimum collateral score threshold for asset eligibility (#1312).
+    ///
+    /// # Returns
+    /// The minimum collateral score (0-100) required for an asset to be eligible as collateral
+    ///
+    /// # Panics
+    /// - [`ContractError::NotInitialized`] if contract has not been initialized
+    pub fn get_min_collateral_score(env: Env) -> u32 {
+        let config: Config = env
+            .storage()
+            .persistent()
+            .get(&CONFIG)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
+        config.min_collateral_score
+    }
+
     /// Returns the timestamp of the most recent maintenance event, or None if no maintenance has been submitted.
     ///
     /// # Panics
