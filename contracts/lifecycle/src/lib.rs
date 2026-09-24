@@ -2185,6 +2185,7 @@ impl Lifecycle {
             cost,
             ownership_start_ledger,
             previous_record_hash,
+            reconstructed: false,
         };
 
         history.push_back(record);
@@ -2350,6 +2351,7 @@ impl Lifecycle {
             cost: None,
             ownership_start_ledger: Some(current_ledger),
             previous_record_hash,
+            reconstructed: false,
         };
         history.push_back(sentinel);
         let sentinel_index = history.len() - 1;
@@ -2636,6 +2638,7 @@ impl Lifecycle {
                 cost: rec_cost,
                 ownership_start_ledger,
                 previous_record_hash: chain_link,
+                reconstructed: false,
             };
             chain_link = Some(hash_maintenance_record(&env, &new_record));
             new_records.push_back(new_record);
@@ -3668,6 +3671,14 @@ impl Lifecycle {
             .persistent()
             .get(&DataKey::OwnershipStartLedger(asset_id));
 
+        let mut history: Vec<MaintenanceRecord> = env
+            .storage()
+            .persistent()
+            .get(&history_key(asset_id))
+            .unwrap_or(Vec::new(&env));
+
+        let previous_record_hash = next_chain_link(&env, &history);
+
         let record = MaintenanceRecord {
             asset_id,
             task_type: task_type.clone(),
@@ -3677,13 +3688,9 @@ impl Lifecycle {
             timestamp,
             cost: None,
             ownership_start_ledger,
+            previous_record_hash,
+            reconstructed: false,
         };
-
-        let mut history: Vec<MaintenanceRecord> = env
-            .storage()
-            .persistent()
-            .get(&history_key(asset_id))
-            .unwrap_or(Vec::new(&env));
 
         let config: Config = env
             .storage()
@@ -5342,6 +5349,94 @@ impl Lifecycle {
             (symbol_short!("ADM_AUD"), symbol_short!("RECON")),
             (admin, asset_id, env.ledger().timestamp()),
         );
+    }
+
+    /// Reconstruct partial maintenance history from health snapshots (#1314).
+    ///
+    /// Generates synthetic MaintenanceRecord placeholders using timestamps from
+    /// health snapshots to recover approximate history after TTL-driven pruning.
+    /// Reconstructed records are marked with `reconstructed: true` and use
+    /// placeholder values (task_type "RECO", Priority::Low, empty notes).
+    ///
+    /// # Arguments
+    /// * `asset_id` - The asset to reconstruct history for
+    ///
+    /// # Returns
+    /// The number of reconstructed records inserted
+    ///
+    /// # Panics
+    /// - [`ContractError::NotInitialized`] if the contract has not been initialized
+    /// - [`ContractError::SnapshotNotFound`] if no snapshots exist for the asset
+    pub fn reconstruct_history_from_snapshots(env: Env, asset_id: u64) -> u32 {
+        ensure_not_paused(&env);
+
+        let snapshots_key = health_snapshot_key(asset_id);
+        let snapshots: Vec<HealthSnapshot> = env
+            .storage()
+            .persistent()
+            .get(&snapshots_key)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::SnapshotNotFound));
+
+        if snapshots.is_empty() {
+            panic_with_error!(&env, ContractError::SnapshotNotFound);
+        }
+
+        let mut history: Vec<MaintenanceRecord> = env
+            .storage()
+            .persistent()
+            .get(&history_key(asset_id))
+            .unwrap_or(Vec::new(&env));
+
+        let ownership_start_ledger: Option<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::OwnershipStartLedger(asset_id));
+
+        let mut reconstructed_count: u32 = 0;
+        for snapshot in snapshots.iter() {
+            // Check if history already has a record at this timestamp
+            let mut already_exists = false;
+            for record in history.iter() {
+                if record.timestamp == snapshot.snapshot_timestamp {
+                    already_exists = true;
+                    break;
+                }
+            }
+
+            if !already_exists {
+                // Create synthetic maintenance record from snapshot
+                let previous_record_hash = next_chain_link(&env, &history);
+                let record = MaintenanceRecord {
+                    asset_id,
+                    task_type: symbol_short!("RECO"),
+                    priority: Priority::Low,
+                    notes: String::from_str(&env, "Reconstructed from snapshot"),
+                    engineer: Address::generate(&env),
+                    timestamp: snapshot.snapshot_timestamp,
+                    cost: None,
+                    ownership_start_ledger,
+                    previous_record_hash,
+                    reconstructed: true,
+                };
+                history.push_back(record);
+                reconstructed_count += 1;
+            }
+        }
+
+        // Persist the updated history
+        if reconstructed_count > 0 {
+            env.storage()
+                .persistent()
+                .set(&history_key(asset_id), &history);
+            extend_persistent_ttl(&env, &history_key(asset_id));
+
+            env.events().publish(
+                (EVENT_RECONSTR, asset_id),
+                (reconstructed_count, env.ledger().timestamp()),
+            );
+        }
+
+        reconstructed_count
     }
 
     /// Predict the next service date for a given task type on an asset.
