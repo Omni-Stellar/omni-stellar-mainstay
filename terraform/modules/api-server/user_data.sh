@@ -4,13 +4,16 @@ set -euo pipefail
 REGION="${region}"
 RPC_URL="${rpc_url}"
 NETWORK="${network}"
+VAULT_ADDR="${vault_address}"
+VAULT_AWS_ROLE="${vault_aws_role}"
+VAULT_SECRET_PATH="${vault_secret_path}"
 
 echo "Bootstrapping omni-stellar-omni-stellar-mainstay API server in $REGION"
 echo "RPC: $RPC_URL"
 
 # ── System updates ─────────────────────────────────────────
 yum update -y
-yum install -y docker git nginx jq amazon-cloudwatch-agent
+yum install -y docker git nginx jq amazon-cloudwatch-agent vault
 
 # ── Docker ─────────────────────────────────────────────────
 systemctl enable docker
@@ -49,6 +52,41 @@ CWAGENT
 systemctl enable amazon-cloudwatch-agent
 systemctl start amazon-cloudwatch-agent
 
+# Authenticate with Vault using the instance IAM role. Secrets are rendered
+# locally with restrictive permissions and never enter Terraform state, user
+# data, Docker arguments, or proxy logs.
+mkdir -p /etc/vault.d /run/omni-stellar-mainstay
+cat > /etc/vault.d/omni-stellar-mainstay-agent.hcl <<VAULT
+pid_file = "/run/vault-agent.pid"
+vault {
+  address = "${VAULT_ADDR}"
+}
+auto_auth {
+  method "aws" {
+    mount_path = "auth/aws"
+    config = {
+      type = "iam"
+      role = "${VAULT_AWS_ROLE}"
+    }
+  }
+  sink "file" {
+    config = { path = "/run/omni-stellar-mainstay/vault-token" }
+  }
+}
+template {
+  source      = "/etc/vault.d/omni-stellar-mainstay.env.tpl"
+  destination = "/run/omni-stellar-mainstay/omni-stellar-mainstay.env"
+  perms       = "0600"
+}
+VAULT
+cat > /etc/vault.d/omni-stellar-mainstay.env.tpl <<'VAULT_TEMPLATE'
+{{- with secret "${VAULT_SECRET_PATH}" }}
+STELLAR_RPC_URL={{ .Data.data.stellar_rpc_url }}
+THIRD_PARTY_API_KEY={{ .Data.data.third_party_api_key }}
+{{- end }}
+VAULT_TEMPLATE
+vault agent -config=/etc/vault.d/omni-stellar-mainstay-agent.hcl >/var/log/vault-agent.log 2>&1 &
+
 # ── Pull API server container ──────────────────────────────
 docker pull ghcr.io/omni-stellar-mainstay/api-server:latest
 
@@ -62,6 +100,7 @@ docker run -d \
   -e DSAR_TABLE_NAME="${dsar_table_name}" \
   -e DSAR_QUEUE_URL="${dsar_queue_url}" \
   -e RUST_LOG=info \
+  --env-file /run/omni-stellar-mainstay/omni-stellar-mainstay.env \
   --memory="512m" \
   --cpus="1" \
   ghcr.io/omni-stellar-mainstay/api-server:latest
