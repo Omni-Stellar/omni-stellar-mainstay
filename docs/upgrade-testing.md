@@ -1,5 +1,7 @@
 # Contract Upgrade Testing
 
+> **Last updated:** 2026-07-30 · **Doc version:** 0.1.0
+
 This document describes how omni-stellar-omni-stellar-mainstay validates that contract upgrades are safe, compatible with existing on-chain state, and recoverable from failures.
 
 ## Overview

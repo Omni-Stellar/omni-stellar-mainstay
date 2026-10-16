@@ -1,5 +1,7 @@
 # Monitoring Guide
 
+> **Last updated:** 2026-07-28 · **Doc version:** 0.1.0
+
 This guide explains how to set up monitoring for omni-stellar-omni-stellar-mainstay smart contracts
 using Prometheus and Grafana.  The setup tracks contract health metrics,
 asset growth, maintenance activity, and collateral scores.

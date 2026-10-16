@@ -48,6 +48,12 @@ jobs:
       - name: Check ContractError variants are documented
         run: bash scripts/check_error_reference.sh
 
+      - name: Validate doc versioning and maintenance metadata (#1724)
+        run: bash scripts/check_doc_metadata.sh
+
+      - name: Validate glossary terms and anchors (#1723)
+        run: bash scripts/check_glossary.sh
+
       - name: Validate symbol_short! usages are within 9-character limit
         run: bash scripts/check_symbol_short.sh
 
