@@ -54,6 +54,9 @@ jobs:
       - name: Validate glossary terms and anchors (#1723)
         run: bash scripts/check_glossary.sh
 
+      - name: Validate video tutorial manifest and captions (#1722)
+        run: python3 scripts/video_tutorials.py check
+
       - name: Validate symbol_short! usages are within 9-character limit
         run: bash scripts/check_symbol_short.sh
 
