@@ -11,6 +11,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and hash-based maintenance evidence attachments to the lifecycle contract.
 
 ### Added
+- Performance tuning guide for operators (#1719): per-operation cost drivers and
+  limits, batching and pagination guidance, metrics to monitor, and a method for
+  recording before/after measurements.
 - API reference generated from the contract sources (#1718): an OpenAPI 3.0
   spec, a Swagger UI explorer with filtering and "Try it out", and curl examples
   for every contract function. Regenerate with `scripts/generate_api_docs.py`.
