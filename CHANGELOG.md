@@ -11,6 +11,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and hash-based maintenance evidence attachments to the lifecycle contract.
 
 ### Added
+- Data model reference (#1720): entity relationship diagrams, state transitions
+  for assets, credentials, and loans, encoding rules for addresses, symbols,
+  hashes, timestamps, and amounts, worked JSON examples, and a data dictionary.
 - Performance tuning guide for operators (#1719): per-operation cost drivers and
   limits, batching and pagination guidance, metrics to monitor, and a method for
   recording before/after measurements.
