@@ -2,6 +2,8 @@
 
 This guide provides a comprehensive technical walkthrough of collateral liens in the omni-stellar-omni-stellar-mainstay protocol. It details how physical industrial assets registered on-chain are encumbered, monitored, released, or liquidated across the loan lifecycle.
 
+> **Terminology:** terms such as *lien*, *collateral*, *covenant* and *liquidation* are defined in the [glossary](GLOSSARY.md).
+
 ---
 
 ## Table of Contents

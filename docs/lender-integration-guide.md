@@ -2,6 +2,8 @@
 
 This guide provides everything a lender or lending protocol needs to integrate with omni-stellar-omni-stellar-mainstay for collateral verification, lien recording, and liquidation.
 
+> **Terminology:** terms such as *lien*, *collateral*, *covenant* and *liquidation* are defined in the [glossary](GLOSSARY.md).
+
 ---
 
 ## Table of Contents
