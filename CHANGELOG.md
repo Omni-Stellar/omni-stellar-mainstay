@@ -11,6 +11,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and hash-based maintenance evidence attachments to the lifecycle contract.
 
 ### Added
+- API reference generated from the contract sources (#1718): an OpenAPI 3.0
+  spec, a Swagger UI explorer with filtering and "Try it out", and curl examples
+  for every contract function. Regenerate with `scripts/generate_api_docs.py`.
 - `scripts/export-assets.py` exports backed-up asset records to CSV and
   dependency-free Excel `.xlsx` workbooks.
 - `omni-stellar-mainstay-sdk`: an official typed Rust facade for registration, asset lookup,
