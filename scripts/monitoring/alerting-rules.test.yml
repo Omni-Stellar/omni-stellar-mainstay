@@ -1,0 +1,60 @@
+# promtool test rules scripts/monitoring/alerting-rules.test.yml
+# Every metric name used by alerting-rules.yml and grafana-dashboard.json.
+rule_files:
+  - alerting-rules.yml
+
+evaluation_interval: 1m
+
+tests:
+  - interval: 1m
+    input_series:
+      - series: omni-stellar-mainstay_exporter_up
+        values: 1+0x10
+      - series: omni-stellar-mainstay_assets_total
+        values: 4+0x10
+      - series: omni-stellar-mainstay_maintenance_records_total
+        values: 7+0x10
+      - series: omni-stellar-mainstay_avg_collateral_score
+        values: 80+0x10
+      - series: omni-stellar-mainstay_scored_assets_count
+        values: 3+0x10
+      - series: omni-stellar-mainstay_engineers_total
+        values: 2+0x10
+      - series: omni-stellar-mainstay_metrics_collection_seconds
+        values: 1+0x10
+    promql_expr_test:
+      - expr: omni-stellar-mainstay_exporter_up
+        eval_time: 5m
+        exp_samples:
+          - labels: '{__name__="omni-stellar-mainstay_exporter_up"}'
+            value: 1
+      - expr: omni-stellar-mainstay_assets_total
+        eval_time: 5m
+        exp_samples:
+          - labels: '{__name__="omni-stellar-mainstay_assets_total"}'
+            value: 4
+      - expr: omni-stellar-mainstay_maintenance_records_total
+        eval_time: 5m
+        exp_samples:
+          - labels: '{__name__="omni-stellar-mainstay_maintenance_records_total"}'
+            value: 7
+      - expr: omni-stellar-mainstay_avg_collateral_score
+        eval_time: 5m
+        exp_samples:
+          - labels: '{__name__="omni-stellar-mainstay_avg_collateral_score"}'
+            value: 80
+      - expr: omni-stellar-mainstay_scored_assets_count
+        eval_time: 5m
+        exp_samples:
+          - labels: '{__name__="omni-stellar-mainstay_scored_assets_count"}'
+            value: 3
+      - expr: omni-stellar-mainstay_engineers_total
+        eval_time: 5m
+        exp_samples:
+          - labels: '{__name__="omni-stellar-mainstay_engineers_total"}'
+            value: 2
+      - expr: omni-stellar-mainstay_metrics_collection_seconds
+        eval_time: 5m
+        exp_samples:
+          - labels: '{__name__="omni-stellar-mainstay_metrics_collection_seconds"}'
+            value: 1
