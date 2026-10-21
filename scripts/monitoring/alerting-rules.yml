@@ -72,25 +72,6 @@ groups:
             for the past 30 minutes. Check the Lifecycle contract and
             engineer credential validity.
 
-      - alert: HighMaintenanceFailureRate
-        expr: |
-          (
-            rate(omni-stellar-mainstay_maintenance_submit_errors_total[10m])
-            /
-            (rate(omni-stellar-mainstay_maintenance_records_total[10m]) + rate(omni-stellar-mainstay_maintenance_submit_errors_total[10m]))
-          ) > 0.1
-        for: 10m
-        labels:
-          severity: warning
-        annotations:
-          summary: "High maintenance submission failure rate"
-          description: >
-            More than 10% of maintenance submissions may be failing.
-            Check for expired credentials, asset-lock issues, or
-            paused contracts. Note: this alert requires a separate
-            error counter (not yet exported); set up error tracking
-            from application logs.
-
       # --- Collateral Score Health ---
 
       - alert: AvgCollateralScoreDropping
