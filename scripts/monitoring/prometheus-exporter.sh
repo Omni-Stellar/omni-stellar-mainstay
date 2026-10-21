@@ -6,7 +6,7 @@
 # HTTP endpoint suitable for Prometheus scraping.
 #
 # Usage:
-#   ./scripts/monitoring/prometheus-exporter.sh [--port <port>]
+#   ./scripts/monitoring/prometheus-exporter.sh [--port <port>] [--bind <address>]
 #
 # Environment variables:
 #   CONTRACT_ASSET_REGISTRY     - Asset Registry contract ID
@@ -15,6 +15,7 @@
 #   STELLAR_NETWORK             - Stellar network
 #   STELLAR_RPC_URL             - Stellar RPC endpoint
 #   EXPORTER_PORT               - HTTP port (default: 9600)
+#   EXPORTER_BIND_ADDRESS       - HTTP bind address (default: 127.0.0.1)
 #   SCRAPE_INTERVAL             - Seconds between scrapes (default: 60)
 # =============================================================================
 
@@ -28,6 +29,7 @@ source .env 2>/dev/null || true
 
 : "${STELLAR_NETWORK:=testnet}"
 : "${EXPORTER_PORT:=9600}"
+: "${EXPORTER_BIND_ADDRESS:=127.0.0.1}"
 : "${SCRAPE_INTERVAL:=60}"
 
 # Temp file for the latest metrics page
@@ -158,8 +160,9 @@ EOF
 
 serve_http() {
     local port="$1"
+    local bind="$2"
 
-    echo "[$(date -u +%H:%M:%S)] Starting Prometheus metrics exporter on :$port"
+    echo "[$(date -u +%H:%M:%S)] Starting Prometheus metrics exporter on ${bind}:${port}"
     echo "[$(date -u +%H:%M:%S)] Scrape interval: ${SCRAPE_INTERVAL}s"
 
     # Initial collection
@@ -181,13 +184,15 @@ serve_http() {
 
     if command -v socat &> /dev/null; then
         echo "[$(date -u +%H:%M:%S)] Using socat for HTTP server"
-        socat TCP-LISTEN:"$port",reuseaddr,fork \
+        socat TCP-LISTEN:"$port",bind="$bind",reuseaddr,fork \
             EXEC:"printf 'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\n'; cat $METRICS_FILE"
     elif command -v python3 &> /dev/null; then
         echo "[$(date -u +%H:%M:%S)] Using Python for HTTP server"
         python3 -c "
-import http.server, os
+import http.server, os, sys
 METRICS_FILE = '$METRICS_FILE'
+port = int(sys.argv[1])
+bind = sys.argv[2]
 class MetricsHandler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == '/metrics' or self.path == '/':
@@ -209,8 +214,8 @@ class MetricsHandler(http.server.BaseHTTPRequestHandler):
             self.end_headers()
     def log_message(self, fmt, *args):
         pass
-http.server.HTTPServer(('0.0.0.0', $port), MetricsHandler).serve_forever()
-" 2>/dev/null
+http.server.HTTPServer((bind, port), MetricsHandler).serve_forever()
+" "$port" "$bind"
     else
         echo "[$(date -u +%H:%M:%S)] Neither socat nor python3 found."
         echo "[$(date -u +%H:%M:%S)] Install one to serve metrics over HTTP."
@@ -225,12 +230,39 @@ http.server.HTTPServer(('0.0.0.0', $port), MetricsHandler).serve_forever()
 # ---------------------------------------------------------------------------
 
 PORT="${EXPORTER_PORT}"
+BIND="${EXPORTER_BIND_ADDRESS}"
 
-if [[ "${1:-}" == "--port" ]]; then
-    PORT="${2:-9600}"
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --port)
+            if [[ -z "${2:-}" ]]; then
+                echo "Option --port requires an integer from 1 to 65535." >&2
+                exit 1
+            fi
+            PORT="$2"
+            shift 2
+            ;;
+        --bind)
+            if [[ -z "${2:-}" ]]; then
+                echo "Option --bind requires an address." >&2
+                exit 1
+            fi
+            BIND="$2"
+            shift 2
+            ;;
+        *)
+            echo "Unknown argument: $1" >&2
+            exit 1
+            ;;
+    esac
+done
+
+if [[ ! "$PORT" =~ ^[0-9]+$ ]] || (( PORT < 1 || PORT > 65535 )); then
+    echo "Invalid port: ${PORT} (expected an integer from 1 to 65535)." >&2
+    exit 1
 fi
 
 echo "=== omni-stellar-omni-stellar-mainstay Prometheus Exporter ==="
 echo "Network: ${STELLAR_NETWORK}"
 
-serve_http "$PORT"
+serve_http "$PORT" "$BIND"
