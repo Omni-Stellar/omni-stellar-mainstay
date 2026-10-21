@@ -1,5 +1,7 @@
 # omni-stellar-omni-stellar-mainstay Multi-Region Deployment Guide
 
+> **Last updated:** 2026-07-28 · **Doc version:** 0.1.0
+
 This guide covers deploying omni-stellar-omni-stellar-mainstay contracts and supporting infrastructure across multiple AWS regions for redundancy, latency optimization, and disaster recovery.
 
 ## Architecture Overview

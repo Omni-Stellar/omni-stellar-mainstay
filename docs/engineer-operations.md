@@ -1,5 +1,7 @@
 # Engineer Operations
 
+> **Last updated:** 2026-09-25 · **Doc version:** 0.1.0
+
 omni-stellar-omni-stellar-mainstay records the operational information needed to develop engineers and
 respond to maintenance risk without relying on informal spreadsheets.
 
