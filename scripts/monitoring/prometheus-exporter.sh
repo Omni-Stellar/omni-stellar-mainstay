@@ -47,6 +47,19 @@ invoke_read() {
         -- "$2" "$3" "$4" "$5" 2>/dev/null || echo "0"
 }
 
+# Length of a get_maintenance_history view. A bare integer is used as-is.
+# Otherwise each MaintenanceRecord in the CLI output contributes one "asset_id".
+history_len_from_view() {
+    local raw="$1"
+    local trimmed="${raw//[[:space:]]/}"
+    if [[ "$trimmed" =~ ^[0-9]+$ ]]; then
+        printf '%s\n' "$trimmed"
+        return 0
+    fi
+    local without="${raw//\"asset_id\"/}"
+    printf '%s\n' "$(( (${#raw} - ${#without}) / 10 ))"
+}
+
 # ---------------------------------------------------------------------------
 # Collect metrics from chain
 # ---------------------------------------------------------------------------
@@ -96,9 +109,7 @@ EOF
         for (( id=1; id<=total_assets; id++ )); do
             local hist_len
             hist_len="$(invoke_read "$CONTRACT_LIFECYCLE" get_maintenance_history --asset_id "$id" 2>/dev/null || echo "0")"
-            # Count entries (this is approximate — the raw output from stellar CLI
-            # is not natively parseable as JSON in all versions; adapt as needed)
-            total_records=$((total_records + 1))
+            total_records=$((total_records + $(history_len_from_view "$hist_len")))
 
             local score
             score="$(invoke_read "$CONTRACT_LIFECYCLE" get_collateral_score --asset_id "$id" 2>/dev/null || echo "0")"
@@ -228,6 +239,10 @@ http.server.HTTPServer((bind, port), MetricsHandler).serve_forever()
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+
+if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then
+    return 0 2>/dev/null || exit 0
+fi
 
 PORT="${EXPORTER_PORT}"
 BIND="${EXPORTER_BIND_ADDRESS}"
