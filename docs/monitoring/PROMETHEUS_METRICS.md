@@ -265,6 +265,6 @@ The exporter iterates through all assets to collect per-asset metrics. For large
 
 ## Related Documentation
 
-- [Monitoring Guide](./MONITORING.md) - General omni-stellar-omni-stellar-mainstay observability
-- [Event Indexer Guide](./EVENT_INDEXER.md) - Off-chain event tracking
-- [Backup and Recovery](../BACKUP_RECOVERY.md) - Data backup procedures
+- [Monitoring Guide](../monitoring-guide.md) - General omni-stellar-omni-stellar-mainstay observability
+- [Event Indexer Guide](../EVENT_INDEXER.md) - Off-chain event tracking
+- [Backup Procedures](../backup-procedures.md) - Data backup procedures
