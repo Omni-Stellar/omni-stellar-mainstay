@@ -1,28 +1,22 @@
 ---
 name: Bug report
-about: Create a report to help us fix issues quickly.
+about: Create a report to help us improve
+title: '[BUG] '
 labels: bug
 assignees: ''
 ---
 
-## Summary
+## Describe the bug
+A clear and concise description of what the bug is.
 
-## Reproduction Steps
+## To Reproduce
+Steps to reproduce the behavior.
 
-1. 
-2. 
-3. 
+## Expected behavior
+A clear and concise description of what you expected to happen.
 
-## Expected Behavior
+## Screenshots
+If applicable, add screenshots to help explain your problem.
 
-## Actual Behavior
-
-## Environment
-
-- Branch:
-- Commit:
-- Network / environment:
-
-## Notes
-
-Please see `CONTRIBUTING.md` for contribution guidelines.
+## Additional context
+Add any other context about the problem here.
