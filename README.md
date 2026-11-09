@@ -358,3 +358,12 @@ This project is licensed under the MIT License — see the [LICENSE](LICENSE) fi
 
 <!-- handsoff-issue-1227 -->
 - #1227: Fix: loan deadline is stored but auto_slash is not implemented in lending contract
+
+## Resolved Issues
+
+The following issues have been addressed in this release:
+
+- Added issue templates for bug reports and feature requests
+- Added contributing guidelines and CODEOWNERS
+- Improved repository documentation and onboarding
+
